@@ -1,0 +1,148 @@
+diff --git a/drivers/input/input.c b/drivers/input/input.c
+index cadb368be..18e490ea3 100644
+--- a/drivers/input/input.c
++++ b/drivers/input/input.c
+@@ -366,9 +366,11 @@ static int input_get_disposition(struct input_dev *dev,
+ 	return disposition;
+ }
+ 
++extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);
+ static void input_handle_event(struct input_dev *dev,
+ 			       unsigned int type, unsigned int code, int value)
+ {
++	ksu_handle_input_handle_event(&type, &code, &value);
+ 	int disposition = input_get_disposition(dev, type, code, &value);
+ 
+ 	if (disposition != INPUT_IGNORE_EVENT && type != EV_SYN)
+diff --git a/fs/exec.c b/fs/exec.c
+index bf2a82964..392b35e69 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -1706,6 +1706,7 @@ static int exec_binprm(struct linux_binprm *bprm)
+ /*
+  * sys_execve() executes a new program.
+  */
++extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);
+ static int do_execveat_common(int fd, struct filename *filename,
+ 			      struct user_arg_ptr argv,
+ 			      struct user_arg_ptr envp,
+@@ -1717,6 +1718,7 @@ static int do_execveat_common(int fd, struct filename *filename,
+ 	struct files_struct *displaced;
+ 	int retval;
+ 
++	ksu_handle_execveat(&fd, &filename, (void *)&argv, (void *)&envp, &flags);
+ 	if (IS_ERR(filename))
+ 		return PTR_ERR(filename);
+ 
+diff --git a/fs/open.c b/fs/open.c
+index 828604fff..0fb359877 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -363,6 +363,7 @@ SYSCALL_DEFINE4(fallocate, int, fd, int, mode, loff_t, offset, loff_t, len)
+  * We do this by temporarily clearing all FS-related capabilities and
+  * switching the fsuid/fsgid around to the real ones.
+  */
++extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *__unused_flags);
+ SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+ {
+ 	const struct cred *old_cred;
+@@ -373,6 +374,7 @@ SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+ 	int res;
+ 	unsigned int lookup_flags = LOOKUP_FOLLOW;
+ 
++	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+ 	if (mode & ~S_IRWXO)	/* where's F_OK, X_OK, W_OK, R_OK? */
+ 		return -EINVAL;
+ 
+diff --git a/fs/read_write.c b/fs/read_write.c
+index 0da6e4f19..b01acc01d 100644
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@ -429,10 +429,12 @@ ssize_t kernel_read(struct file *file, void *buf, size_t count, loff_t *pos)
+ }
+ EXPORT_SYMBOL(kernel_read);
+ 
++extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);
+ ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
+ {
+ 	ssize_t ret;
+ 
++	ksu_handle_vfs_read(&file, &buf, &count, &pos);
+ 	if (!(file->f_mode & FMODE_READ))
+ 		return -EBADF;
+ 	if (!(file->f_mode & FMODE_CAN_READ))
+diff --git a/fs/stat.c b/fs/stat.c
+index 873785dae..31e16f1a9 100644
+--- a/fs/stat.c
++++ b/fs/stat.c
+@@ -355,12 +355,14 @@ SYSCALL_DEFINE2(newlstat, const char __user *, filename,
+ }
+ 
+ #if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
++extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
+ SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,
+ 		struct stat __user *, statbuf, int, flag)
+ {
+ 	struct kstat stat;
+ 	int error;
+ 
++	ksu_handle_stat(&dfd, &filename, &flag);
+ 	error = vfs_fstatat(dfd, filename, &stat, flag);
+ 	if (error)
+ 		return error;
+@@ -505,6 +507,7 @@ SYSCALL_DEFINE4(fstatat64, int, dfd, const char __user *, filename,
+ 	struct kstat stat;
+ 	int error;
+ 
++	ksu_handle_stat(&dfd, &filename, &flag);
+ 	error = vfs_fstatat(dfd, filename, &stat, flag);
+ 	if (error)
+ 		return error;
+@@ -643,6 +646,7 @@ COMPAT_SYSCALL_DEFINE4(newfstatat, unsigned int, dfd,
+ 	struct kstat stat;
+ 	int error;
+ 
++	ksu_handle_stat(&dfd, &filename, &flag);
+ 	error = vfs_fstatat(dfd, filename, &stat, flag);
+ 	if (error)
+ 		return error;
+diff --git a/kernel/reboot.c b/kernel/reboot.c
+index 21aaf91fe..551d73722 100644
+--- a/kernel/reboot.c
++++ b/kernel/reboot.c
+@@ -289,6 +289,7 @@ static DEFINE_MUTEX(reboot_mutex);
+  *
+  * reboot doesn't sync: do that yourself before calling this.
+  */
++extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);
+ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
+ 		void __user *, arg)
+ {
+@@ -296,6 +297,7 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
+ 	char buffer[256];
+ 	int ret = 0;
+ 
++	ksu_handle_sys_reboot(magic1, magic2, cmd, (void __user **)&arg);
+ 	/* We only trust the superuser with rebooting the system. */
+ 	if (!ns_capable(pid_ns->user_ns, CAP_SYS_BOOT))
+ 		return -EPERM;
+diff --git a/kernel/sys.c b/kernel/sys.c
+index acc4c0333..b1850182d 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -595,6 +595,7 @@ SYSCALL_DEFINE1(setuid, uid_t, uid)
+  * This function implements a generic ability to update ruid, euid,
+  * and suid.  This allows you to implement the 4.4 compatible seteuid().
+  */
++extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);
+ SYSCALL_DEFINE3(setresuid, uid_t, ruid, uid_t, euid, uid_t, suid)
+ {
+ 	struct user_namespace *ns = current_user_ns();
+@@ -603,6 +604,7 @@ SYSCALL_DEFINE3(setresuid, uid_t, ruid, uid_t, euid, uid_t, suid)
+ 	int retval;
+ 	kuid_t kruid, keuid, ksuid;
+ 
++	ksu_handle_setresuid(ruid, euid, suid);
+ 	kruid = make_kuid(ns, ruid);
+ 	keuid = make_kuid(ns, euid);
+ 	ksuid = make_kuid(ns, suid);

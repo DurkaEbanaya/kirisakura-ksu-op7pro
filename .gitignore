@@ -1,0 +1,6 @@
+Image
+*.img
+*.img.xz
+*.apk
+*.apk.xz
+kirisakura-build-work/
