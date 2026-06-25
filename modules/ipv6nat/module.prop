@@ -1,0 +1,6 @@
+id=ipv6nat
+name=IPv6 NAT Support
+version=v1.0
+versionCode=1
+author=DurkaEbanaya
+description=Loads IPv6 NAT kernel modules (nf_nat_ipv6, nf_nat_masquerade_ipv6, ip6table_nat, ip6t_MASQUERADE) at boot to enable WiFi hotspot tethering. Required because CONFIG_NF_NAT_IPV6 is built as module (=m) to avoid kernel crash.

@@ -3,4 +3,6 @@ Image
 *.img.xz
 *.apk
 *.apk.xz
+*.ko
+*.zip
 kirisakura-build-work/

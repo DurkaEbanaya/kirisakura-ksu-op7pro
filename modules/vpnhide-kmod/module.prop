@@ -1,0 +1,6 @@
+id=vpnhide_kmod
+name=VPN Hide (kernel built-in)
+version=v0.7.1-builtin-4.14
+versionCode=701
+author=okhsunrog (4.14 built-in port by DurkaEbanaya)
+description=Hides VPN interfaces from selected apps at the kernel level. Built into the Kirisakura kernel (CONFIG_VPNHIDE=y) — no .ko needed. Manage targets via VPN Hide app or shell.
