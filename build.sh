@@ -4,6 +4,7 @@ set -e
 # ============================================================
 # OnePlus 7 Pro (guacamole) Kirisakura + KSU-Next kernel build
 # Kernel: Kirisakura 4.14.243 (freak07/Kirisakura_OP7Pro_A11)
+# + 161 security patches from linux-4.14.244..4.14.336
 # KSU-Next: v3.1.0-legacy (version 33024, manual hooks)
 # Toolchain: Clang 14, LLD 14, GNU cross GCC 11
 # ============================================================
@@ -14,16 +15,19 @@ KERNEL_BRANCH="master_stock_caf_linux-upstream_vdso32_sched_final_2"
 DEFCONFIG="stock_defconfig"
 KSU_REPO="https://github.com/rifsxd/KernelSU-Next.git"
 KSU_TAG="v3.1.0-legacy"
+STABLE_REPO="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git"
+STABLE_BRANCH="linux-4.14.y"
 IMAGE_NAME="op7-kernel-builder"
 
 # --- Paths ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_DIR="${WORK_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)/kirisakura-build-work}"
 CONTAINER_KERNEL_DIR="/build/kernel"
-CONTAINER_OUT_DIR="${CONTAINER_KERNEL_DIR}/out"
+STABLE_DIR="/build/linux-stable"
 
 mkdir -p "${WORK_DIR}"
 cp "${SCRIPT_DIR}/manual-hooks.patch" "${WORK_DIR}/manual-hooks.patch"
+cp "${SCRIPT_DIR}/security-patches-shas.txt" "${WORK_DIR}/security-patches-shas.txt"
 
 # --- Docker builder image setup ---
 if docker image inspect ${IMAGE_NAME} >/dev/null 2>&1; then
@@ -70,6 +74,67 @@ docker exec op7-build bash -c "
     fi
 "
 
+# --- Clone linux-stable 4.14.y and cherry-pick security patches ---
+echo "[*] Cloning linux-stable 4.14.y for security patches..."
+docker exec op7-build bash -c "
+    if [ ! -f ${STABLE_DIR}/Makefile ]; then
+        rm -rf ${STABLE_DIR}
+        git clone --shallow-since='2021-07-01' --single-branch --branch ${STABLE_BRANCH} ${STABLE_REPO} ${STABLE_DIR}
+    fi
+"
+
+echo "[*] Adding linux-stable as remote and fetching..."
+docker exec op7-build bash -c "
+    cd ${CONTAINER_KERNEL_DIR}
+    git remote remove stable 2>/dev/null || true
+    git remote add stable ${STABLE_DIR}
+    git fetch stable --tags 2>/dev/null || true
+"
+
+echo "[*] Cherry-picking 161 security patches (4.14.244 -> 4.14.336)..."
+docker exec op7-build bash -c "
+    cd ${CONTAINER_KERNEL_DIR}
+    if git log --oneline | head -1 | grep -q 'binder: use euid'; then
+        echo '[*] Security patches already applied'
+    else
+        SUCCESS=0; SKIPPED=0
+        while read -r sha; do
+            [ -z \"\${sha}\" ] && continue
+            if git cherry-pick \"\${sha}\" 2>/dev/null; then
+                SUCCESS=\$((SUCCESS + 1))
+            else
+                CONFLICTED=\$(git diff --name-only --diff-filter=U 2>/dev/null)
+                if [ -z \"\${CONFLICTED}\" ]; then
+                    git cherry-pick --skip 2>/dev/null
+                    SKIPPED=\$((SKIPPED + 1))
+                else
+                    # Check if all conflicts are docs only
+                    ALL_DOCS=true
+                    for f in \${CONFLICTED}; do
+                        case \"\${f}\" in
+                            Documentation/*|*.txt|*.rst|*.md) ;;
+                            *) ALL_DOCS=false; break ;;
+                        esac
+                    done
+                    if [ \"\${ALL_DOCS}\" = true ]; then
+                        for f in \${CONFLICTED}; do
+                            git checkout --theirs \"\${f}\" 2>/dev/null
+                            git add \"\${f}\" 2>/dev/null
+                        done
+                        git cherry-pick --continue --no-edit 2>/dev/null
+                        SUCCESS=\$((SUCCESS + 1))
+                    else
+                        git cherry-pick --abort 2>/dev/null
+                        SKIPPED=\$((SKIPPED + 1))
+                        echo \"[!] SKIP: \$(echo \${sha} | cut -c1-12) \$(git log -1 --format='%s' \${sha} 2>/dev/null | head -c 50)\"
+                    fi
+                fi
+            fi
+        done < /mnt/security-patches-shas.txt
+        echo \"[+] Cherry-picked: \${SUCCESS} success, \${SKIPPED} skipped\"
+    fi
+"
+
 # --- Clone KSU-Next and checkout legacy tag ---
 echo "[*] Cloning KernelSU-Next (${KSU_TAG})..."
 docker exec op7-build bash -c "
@@ -100,7 +165,8 @@ docker exec op7-build bash -c "
     if git apply --reverse --check /mnt/manual-hooks.patch >/dev/null 2>&1; then
         echo '[*] manual-hooks.patch already applied'
     else
-        git apply --fuzz=3 /mnt/manual-hooks.patch
+        git apply /mnt/manual-hooks.patch 2>/dev/null || patch -p1 < /mnt/manual-hooks.patch
+        echo '[+] Manual hooks applied'
     fi
 "
 
@@ -175,6 +241,7 @@ docker exec op7-build bash -c "
 # Fix 5: techpack/audio broken symlinks -> real file copies
 docker exec op7-build bash -c "
     cd ${CONTAINER_KERNEL_DIR}
+    rm -f techpack/audio/soc/core.h techpack/audio/soc/pinctrl-utils.h techpack/audio/include/soc/internal.h
     cp drivers/pinctrl/core.h techpack/audio/soc/core.h
     cp drivers/pinctrl/pinctrl-utils.h techpack/audio/soc/pinctrl-utils.h
     cp drivers/base/regmap/internal.h techpack/audio/include/soc/internal.h
@@ -182,8 +249,26 @@ docker exec op7-build bash -c "
 
 # Fix 6: oneplus_healthinfo missing timer declaration
 docker exec op7-build bash -c "
+    grep -q 'task_load_info_timer' ${CONTAINER_KERNEL_DIR}/drivers/oneplus/oneplus_healthinfo/oneplus_healthinfo.c || \
     sed -i '/^static struct proc_dir_entry \*oneplus_healthinfo;/a static struct timer_list task_load_info_timer;' \
         ${CONTAINER_KERNEL_DIR}/drivers/oneplus/oneplus_healthinfo/oneplus_healthinfo.c
+"
+
+# Fix 7: event_timer timerqueue_head init (CVE-2021-20317 changed struct)
+docker exec op7-build bash -c "
+    cd ${CONTAINER_KERNEL_DIR}
+    if grep -q '\.head = RB_ROOT' drivers/soc/qcom/event_timer.c 2>/dev/null; then
+        sed -i 's/\.head = RB_ROOT,/\.rb_root = RB_ROOT_CACHED,/' drivers/soc/qcom/event_timer.c
+        sed -i '/\.next = NULL,/d' drivers/soc/qcom/event_timer.c
+        echo '[+] Fix 7: event_timer timerqueue init'
+    fi
+"
+
+# Fix 8: KALLSYMS_BASE_RELATIVE overflow (kernel too large with security patches + WiFi built-in)
+docker exec op7-build bash -c "
+    cd ${CONTAINER_KERNEL_DIR}
+    sed -i 's/default !IA64 && !(TILE && 64BIT)/default n/' init/Kconfig
+    echo '[+] Fix 8: KALLSYMS_BASE_RELATIVE disabled in Kconfig'
 "
 
 # --- Update defconfig ---

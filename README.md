@@ -1,10 +1,21 @@
 # Kirisakura-KSU-Next — OnePlus 7 Pro (guacamole)
 
-Custom kernel **Kirisakura 4.14.243** with **KernelSU-Next v3.1.0-legacy** (version 33024) for OnePlus 7 Pro on stock OxygenOS 11 (`GM1910_21_220617`, Android 11).
+Custom kernel **Kirisakura 4.14.243** with **KernelSU-Next v3.1.0-legacy** (version 33024) and **161 security patches** from linux-4.14.244–4.14.336 for OnePlus 7 Pro on stock OxygenOS 11 (`GM1910_21_220617`, Android 11).
 
 **Working:** Root (KSU Next) · FOD fingerprint · WiFi · Bluetooth · SELinux Enforcing
 
 ---
+
+## What's new in v2.0
+
+**161 security patches** cherry-picked from linux-4.14.y stable (v4.14.244 → v4.14.336, EOL January 2024). The stock Kirisakura kernel stopped at 4.14.243 — this release backports 93 subsequent stable releases covering:
+
+- **11 CVEs** explicitly tagged in commit messages (CVE-2017-6074, CVE-2018-1000204, CVE-2020-16119, CVE-2021-20317, CVE-2021-3573, CVE-2022-0435, CVE-2022-2586, CVE-2022-2588, CVE-2023-31436, CVE-2023-3772, CVE-2023-1989)
+- **~150 additional bug fixes** for use-after-free, out-of-bounds, race conditions, null pointer dereferences, memory leaks, and integer overflows across net, mm, kernel, security, fs, block, crypto, and drivers
+- **Binder security patch** (manually resolved with OnePlus OP_FREEZER code + 4.14 SELinux API)
+- 22 patches skipped due to code conflicts with Qualcomm/OnePlus custom code
+
+See [SECURITY-PATCHES.md](SECURITY-PATCHES.md) for the full list.
 
 ## Why this kernel
 
@@ -15,12 +26,14 @@ The stock OnePlus 7 Pro kernel (4.14.190) works fine, but there was no KSU-Next 
 | Feature | Value |
 |---|---|
 | Kernel base | Kirisakura 4.14.243 (`freak07/Kirisakura_OP7Pro_A11`, branch `master_stock_caf_linux-upstream_vdso32_sched_final_2`) |
+| Security patches | 161 commits from linux-4.14.244–4.14.336 (v2.0) |
 | Defconfig | `stock_defconfig` (pure OnePlus stock, no CFI/LTO/SCS) |
 | KernelSU-Next | v3.1.0-legacy, version 33024, manual hooks |
 | FOD | Stock OOS path preserved — no `fod_property`, no `dimlayer_hbm` boolean, original `fppressed_index` plane-alpha handling |
 | Wi-Fi (qcacld-3.0) | Built-in (`CONFIG_QCA_CLD_WLAN=y`) — no external module needed |
 | MODULE_SIG_FORCE | Disabled — allows loading unsigned modules |
 | SELinux | Enforcing (stock) — `selinux_state` moved from `__rticdata` to regular `.bss` |
+| KALLSYMS | Absolute mode (`KALLSYMS_BASE_RELATIVE` disabled — kernel image too large for relative mode with security patches + WiFi built-in) |
 | Boot header | v2 (A/B, standard AOSP) |
 | Toolchain | Clang 14, LLD 14, GNU cross GCC 11 |
 
@@ -44,15 +57,17 @@ See `manual-hooks.patch` for the exact diff.
 
 | # | File | Problem | Fix |
 |---|---|---|---|
-| 1 | `scripts/gcc-wrapper.py` | Python 2 syntax (`print >> sys.stderr`) on Python 3 system | Rewritten for Python 3 |
+| 1 | `scripts/gcc-wrapper.py` | Python 2 syntax on Python 3 system | Rewritten for Python 3 |
 | 2 | 78 Makefile/Kbuild files | `-Werror` triggers on GCC 11 / Clang 14 with 2019-era Qualcomm code | Relaxed `-Werror` → `-Wno-error` globally |
-| 3 | `security/selinux/hooks.c` | `selinux_state __rticdata` causes `R_AARCH64_ADR_PREL_PG_HI21` relocation overflow | Removed `__rticdata` attribute (moves to regular `.bss`) |
-| 4 | `drivers/platform/msm/ipa/ipa_v3/ipa_hw_stats.c` | `copy_from_user` without size guard at line 2072 — GCC 11 `__bad_copy_to` error | Added `min_t(size_t, count, sizeof(dbg_buff))` guard |
-| 5 | `techpack/audio/soc/core.h`, `pinctrl-utils.h`, `include/soc/internal.h` | Broken symlinks (target files don't exist in tree) | Replaced with real file copies from `drivers/pinctrl/` and `drivers/base/regmap/` |
-| 6 | `drivers/oneplus/oneplus_healthinfo/oneplus_healthinfo.c` | Missing `static struct timer_list task_load_info_timer` declaration — used in code but not declared | Added declaration |
-| 7 | `arch/arm64/configs/stock_defconfig` | `CONFIG_QCA_CLD_WLAN` not set — WiFi driver not built | Enabled `CONFIG_QCA_CLD_WLAN=y` (built-in) |
-| 8 | `arch/arm64/configs/stock_defconfig` | `CONFIG_MODULE_SIG_FORCE=y` — blocks unsigned modules | Disabled |
-| 9 | `arch/arm64/configs/stock_defconfig` | ZRAM code uses `ac_time` field without `CONFIG_ZRAM_MEMORY_TRACKING` ifdef guard | Enabled `ZRAM_MEMORY_TRACKING`, `ZRAM_WRITEBACK`, `ZRAM_DEDUP` |
+| 3 | `security/selinux/hooks.c` | `selinux_state __rticdata` relocation overflow | Removed `__rticdata` attribute |
+| 4 | `drivers/platform/msm/ipa/ipa_v3/ipa_hw_stats.c` | `copy_from_user` without size guard | Added `min_t(size_t, count, sizeof(dbg_buff))` guard |
+| 5 | `techpack/audio/soc/` | Broken symlinks | Replaced with real file copies |
+| 6 | `drivers/oneplus/oneplus_healthinfo/oneplus_healthinfo.c` | Missing `task_load_info_timer` declaration | Added declaration |
+| 7 | `drivers/soc/qcom/event_timer.c` | CVE-2021-20317 changed `struct timerqueue_head` members | Updated init from `.head = RB_ROOT` to `.rb_root = RB_ROOT_CACHED` |
+| 8 | `init/Kconfig` | `KALLSYMS_BASE_RELATIVE` overflows with larger kernel image | Disabled (default `n`) |
+| 9 | `arch/arm64/configs/stock_defconfig` | WiFi driver not built | Enabled `CONFIG_QCA_CLD_WLAN=y` (built-in) |
+| 10 | `arch/arm64/configs/stock_defconfig` | `CONFIG_MODULE_SIG_FORCE=y` blocks unsigned modules | Disabled |
+| 11 | `arch/arm64/configs/stock_defconfig` | ZRAM code uses `ac_time` without ifdef guard | Enabled `ZRAM_MEMORY_TRACKING`, `ZRAM_WRITEBACK`, `ZRAM_DEDUP` |
 
 ## FOD root cause
 
@@ -73,6 +88,8 @@ The Goodix driver was **byte-identical** between LineageOS and stock — the dis
 | `manual-hooks.patch` | 7 KSU-Next manual hooks (git diff) |
 | `kernel.config` | Final `.config` used for the build |
 | `build.sh` | Full automated build script (Docker-based, Clang 14) |
+| `security-patches-shas.txt` | 161 SHA-1 hashes of cherry-picked commits |
+| `SECURITY-PATCHES.md` | Full changelog of security patches with CVEs and subsystems |
 
 Prebuilt boot image and manager APK are in [Releases](../../releases).
 
@@ -80,16 +97,16 @@ Prebuilt boot image and manager APK are in [Releases](../../releases).
 
 ```bash
 # Download from Releases
-# - kirisakura-ksu-boot.img.xz    (flashable boot image)
-# - KernelSU-Next-manager-v3.1.0.apk.xz  (manager app)
+# - kirisakura-ksu-security-boot.img.xz    (flashable boot image, v2.0)
+# - KernelSU-Next-manager-v3.1.0.apk.xz    (manager app)
 
 # Decompress
-xz -d kirisakura-ksu-boot.img.xz
+xz -d kirisakura-ksu-security-boot.img.xz
 xz -d KernelSU-Next-manager-v3.1.0.apk.xz
 
 # Flash kernel to active slot
 adb reboot bootloader
-fastboot flash boot_b kirisakura-ksu-boot.img    # active slot is _b on OOS 11
+fastboot flash boot_b kirisakura-ksu-security-boot.img    # active slot is _b on OOS 11
 fastboot reboot
 
 # Install manager
@@ -134,8 +151,15 @@ bash build.sh
 #   1. Obtain stock OOS11 boot.img (from OTA payload-dumper-go)
 #   2. magiskboot unpack stock-boot.img
 #   3. cp Image kernel
-#   4. magiskboot repack stock-boot.img kirisakura-ksu-boot.img
+#   4. magiskboot repack stock-boot.img kirisakura-ksu-security-boot.img
 ```
+
+The build script automatically:
+1. Clones Kirisakura kernel source
+2. Clones linux-stable 4.14.y and cherry-picks 161 security patches
+3. Integrates KernelSU-Next v3.1.0-legacy
+4. Applies manual hooks + 11 build fixes
+5. Builds with Clang 14 + LLD 14
 
 ## Device info
 
@@ -147,7 +171,7 @@ bash build.sh
 | Android | 11 (OxygenOS 11) |
 | Build | GM1910_21_220617 |
 | Stock kernel | 4.14.190-perf+ |
-| This kernel | 4.14.243-perf (Kirisakura, +53 sublevels) |
+| This kernel | 4.14.243-perf (Kirisakura, +53 sublevels, +161 security patches) |
 | Boot slot | A/B, active `_b` |
 | Boot header | v2 |
 | Boot size | 96 MB (100663296 bytes) |
@@ -195,7 +219,7 @@ On A/B devices, each slot is a **complete OS copy** — `boot`, `system`, `vendo
    ```
 3. Flash custom boot:
    ```bash
-   fastboot flash boot_b kirisakura-ksu-boot.img
+   fastboot flash boot_b kirisakura-ksu-security-boot.img
    ```
 4. To revert:
    ```bash
@@ -229,3 +253,4 @@ dd if=/dev/block/bootdevice/by-name/dtbo_b   of=/dev/block/bootdevice/by-name/dt
 - [KernelSU-Next](https://github.com/rifsxd/KernelSU-Next) (rifsxd) — root solution
 - [Kirisakura](https://github.com/freak07/Kirisakura_OP7Pro_A11) (freak07) — kernel base, OOS-based with linux-stable + EAS backports
 - [OnePlusOSS](https://github.com/OnePlusOSS/android_kernel_oneplus_sm8150) — original kernel source
+- [linux-stable](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git) — security patches (4.14.244–4.14.336)
