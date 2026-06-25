@@ -1,5 +1,47 @@
 # Changelog
 
+## v2.2 (2026-06-26)
+
+### Added
+- **tetherctrl-builtin.patch** — complete diff of 4 kernel source files for the built-in hotspot fix
+- **`CONFIG_BUILD_ARM64_UNCOMPRESSED_KERNEL=y`** documented as critical boot fix (was already in config but not documented)
+
+### Changed — IPv6 NAT now built-in (`=y`), no modules needed
+- `CONFIG_NF_NAT_IPV6=m` → `=y` (built-in)
+- `CONFIG_NF_NAT_MASQUERADE_IPV6=m` → `=y` (built-in)
+- `CONFIG_IP6_NF_NAT=m` → `=y` (built-in)
+- `CONFIG_IP6_NF_TARGET_MASQUERADE=m` → `=y` (built-in)
+
+### Fixed — three root causes, all resolved at kernel level
+
+1. **IPv6 NAT built-in crash → Makefile link order** (`net/ipv6/netfilter/Makefile`)
+   - `ip6table_nat.o` was linked BEFORE `nf_nat_ipv6.o`/`nf_nat_masquerade_ipv6.o`
+   - Reordered to match IPv4's link order — dependencies first, consumers after
+   - `CONFIG_NF_NAT_IPV6=y` now works without crashdump
+
+2. **tetherctrl chains pre-created in kernel initial table** (3 files)
+   - `net/ipv6/netfilter/ip6table_nat.c` — `tetherctrl_nat_POSTROUTING` chain + JUMP from POSTROUTING hook
+   - `net/ipv6/netfilter/ip6table_filter.c` — `tetherctrl_FORWARD` + `tetherctrl_counters` chains + JUMP from FORWARD hook
+   - `net/ipv4/netfilter/iptable_filter.c` — `tetherctrl_counters` chain (critical: IPv4 was the missing piece)
+   - Chains exist from kernel boot, before any userspace process runs
+   - No `post-fs-data.sh`, no `iptables -N`, no `insmod`
+
+3. **`CONFIG_BUILD_ARM64_UNCOMPRESSED_KERNEL=y`** — boot image must be uncompressed
+   - Without this, kernel builds as GZIP-compressed `Image.gz` and bootloops on OnePlus 7 Pro
+   - The boot partition expects a raw `Image`, not `Image.gz`
+
+### Removed
+- **KSU module `ipv6nat`** — completely eliminated
+  - v2.1 required a KSU module with `post-fs-data.sh` to load `.ko` modules and create iptables chains
+  - v2.2 does everything in the kernel — zero modules, zero userspace scripts
+  - `modules/ipv6nat/` directory removed from repo
+
+### Known limitations
+- VPNHide hides VPN at native/kernel level only — Java API level (`ConnectivityManager.hasTransport(VPN)`) requires LSPosed or Zygisk
+- `tetherctrl-builtin.patch` uses byte-offset pointer arithmetic (not array indexing) because `ip6t_error` is larger than `ip6t_standard` — mixed types in a contiguous buffer require manual offset management
+
+---
+
 ## v2.1 (2026-06-25)
 
 ### Added
@@ -25,10 +67,10 @@
 - `kernel.config`: added `CONFIG_VPNHIDE=y`, `CONFIG_NF_NAT_IPV6=m`, `CONFIG_NF_NAT_MASQUERADE_IPV6=m`, `CONFIG_IP6_NF_NAT=m`, `CONFIG_IP6_NF_TARGET_MASQUERADE=m`
 - README updated with v2.1 features, VPNHide documentation, hotspot fix summary
 
-### Known limitations
-- `CONFIG_NF_NAT_IPV6=y` (built-in) crashes kernel on Qualcomm SDM855 arm64 4.14 — must use modules (`=m`)
+### Known limitations (v2.1 — superseded by v2.2)
+- ~~`CONFIG_NF_NAT_IPV6=y` (built-in) crashes kernel on Qualcomm SDM855 arm64 4.14 — must use modules (`=m`)~~ — **Fixed in v2.2: Makefile link order was the root cause**
 - VPNHide hides VPN at native/kernel level only — Java API level (`ConnectivityManager.hasTransport(VPN)`) requires LSPosed or Zygisk
-- IPv6 NAT modules + tetherctrl chain pre-creation require KSU module — not purely kernel-level
+- ~~IPv6 NAT modules + tetherctrl chain pre-creation require KSU module — not purely kernel-level~~ — **Fixed in v2.2: fully kernel-level, no KSU module**
 
 ---
 

@@ -1,0 +1,452 @@
+diff --git a/net/ipv4/netfilter/iptable_filter.c b/net/ipv4/netfilter/iptable_filter.c
+index 7667f223d..3189fa303 100644
+--- a/net/ipv4/netfilter/iptable_filter.c
++++ b/net/ipv4/netfilter/iptable_filter.c
+@@ -55,22 +55,99 @@ module_param(forward, bool, 0000);
+ 
+ static int __net_init iptable_filter_table_init(struct net *net)
+ {
+-	struct ipt_replace *repl;
+ 	int err;
++	void *buf;
++	struct ipt_replace *repl;
++	char *data;
++	unsigned int hook_mask, nhooks, hooknum;
++	unsigned int bytes;
++	size_t std_sz, err_sz, total_sz;
+ 
+ 	if (net->ipv4.iptable_filter)
+ 		return 0;
+ 
+-	repl = ipt_alloc_initial_table(&packet_filter);
+-	if (repl == NULL)
++	/*
++	 * Build initial table with tetherctrl_counters chain pre-created.
++	 *
++	 * On Android 11, netd's TetherController::setupChains() fails to
++	 * create the tetherctrl_counters chain in the IPv4 filter table.
++	 * This causes setForwardRules() to fail with "goto 'tetherctrl_counters'
++	 * is not a chain", preventing hotspot/tethering from working.
++	 *
++	 * Pre-creating the chain in the kernel's initial table structure
++	 * ensures it exists from boot. netd's ":tetherctrl_counters -"
++	 * becomes a no-op (with --noflush) and setForwardRules() succeeds.
++	 *
++	 * Layout (6 entries):
++	 *   [0] INPUT    -> ACCEPT (hook+underflow)
++	 *   [1] FORWARD  -> ACCEPT/DROP (hook+underflow, based on forward param)
++	 *   [2] OUTPUT   -> ACCEPT (hook+underflow)
++	 *   [3] tetherctrl_counters chain head (error target)
++	 *   [4] tetherctrl_counters return -> ACCEPT
++	 *   [5] ERROR
++	 */
++	std_sz = sizeof(struct ipt_standard);
++	err_sz = sizeof(struct ipt_error);
++	hook_mask = packet_filter.valid_hooks;
++	nhooks = hweight32(hook_mask);
++	/* 3 hook entries + 1 return = (nhooks+1) standard; 2 error (chain head + ERROR) */
++	total_sz = (nhooks + 1) * std_sz + 2 * err_sz;
++
++	buf = kzalloc(sizeof(*repl) + total_sz, GFP_KERNEL);
++	if (!buf)
+ 		return -ENOMEM;
+-	/* Entry 1 is the FORWARD hook */
+-	((struct ipt_standard *)repl->entries)[1].target.verdict =
+-		forward ? -NF_ACCEPT - 1 : -NF_DROP - 1;
++
++	repl = buf;
++	data = buf + sizeof(*repl);
++
++	strncpy(repl->name, packet_filter.name, sizeof(repl->name));
++	repl->valid_hooks = hook_mask;
++	repl->num_entries = nhooks + 3; /* hooks + chain_head + return + ERROR */
++	repl->size = total_sz;
++
++	hooknum = 0;
++	bytes = 0;
++	for (; hook_mask != 0; hook_mask >>= 1, ++hooknum) {
++		struct ipt_standard *e;
++		if (!(hook_mask & 1))
++			continue;
++
++		repl->hook_entry[hooknum] = bytes;
++		repl->underflow[hooknum] = bytes;
++		e = (struct ipt_standard *)(data + bytes);
++		if (hooknum == NF_INET_FORWARD)
++			*e = (struct ipt_standard)IPT_STANDARD_INIT(
++				forward ? NF_ACCEPT : NF_DROP);
++		else
++			*e = (struct ipt_standard)IPT_STANDARD_INIT(NF_ACCEPT);
++		bytes += std_sz;
++	}
++
++	/* tetherctrl_counters chain head */
++	{
++		struct ipt_error *ch = (struct ipt_error *)(data + bytes);
++		*ch = (struct ipt_error)IPT_ERROR_INIT;
++		strncpy(ch->target.errorname, "tetherctrl_counters",
++			sizeof(ch->target.errorname));
++		bytes += err_sz;
++	}
++
++	/* tetherctrl_counters return */
++	{
++		struct ipt_standard *r = (struct ipt_standard *)(data + bytes);
++		*r = (struct ipt_standard)IPT_STANDARD_INIT(NF_ACCEPT);
++		bytes += std_sz;
++	}
++
++	/* ERROR entry */
++	{
++		struct ipt_error *t = (struct ipt_error *)(data + bytes);
++		*t = (struct ipt_error)IPT_ERROR_INIT;
++	}
+ 
+ 	err = ipt_register_table(net, &packet_filter, repl, filter_ops,
+ 				 &net->ipv4.iptable_filter);
+-	kfree(repl);
++	kfree(buf);
+ 	return err;
+ }
+ 
+diff --git a/net/ipv6/netfilter/Makefile b/net/ipv6/netfilter/Makefile
+index c6ee0cdd0..9e55eb065 100644
+--- a/net/ipv6/netfilter/Makefile
++++ b/net/ipv6/netfilter/Makefile
+@@ -4,23 +4,27 @@
+ #
+ 
+ # Link order matters here.
++# IPv6 conntrack must init BEFORE NAT table/hooks (matches IPv4 order)
+ obj-$(CONFIG_IP6_NF_IPTABLES) += ip6_tables.o
+ obj-$(CONFIG_IP6_NF_FILTER) += ip6table_filter.o
+ obj-$(CONFIG_IP6_NF_MANGLE) += ip6table_mangle.o
+ obj-$(CONFIG_IP6_NF_RAW) += ip6table_raw.o
+ obj-$(CONFIG_IP6_NF_SECURITY) += ip6table_security.o
+-obj-$(CONFIG_IP6_NF_NAT) += ip6table_nat.o
+ 
+ # objects for l3 independent conntrack
+ nf_conntrack_ipv6-y  :=  nf_conntrack_l3proto_ipv6.o nf_conntrack_proto_icmpv6.o
+ 
+-# l3 independent conntrack
++# l3 independent conntrack (must init before NAT l3proto and table)
+ obj-$(CONFIG_NF_CONNTRACK_IPV6) += nf_conntrack_ipv6.o
+ 
++# NAT l3proto (must init before NAT table/hooks)
+ nf_nat_ipv6-y		:= nf_nat_l3proto_ipv6.o nf_nat_proto_icmpv6.o
+ obj-$(CONFIG_NF_NAT_IPV6) += nf_nat_ipv6.o
+ obj-$(CONFIG_NF_NAT_MASQUERADE_IPV6) += nf_nat_masquerade_ipv6.o
+ 
++# NAT table + hooks (must init AFTER conntrack and NAT l3proto)
++obj-$(CONFIG_IP6_NF_NAT) += ip6table_nat.o
++
+ # defrag
+ nf_defrag_ipv6-y := nf_defrag_ipv6_hooks.o nf_conntrack_reasm.o
+ obj-$(CONFIG_NF_DEFRAG_IPV6) += nf_defrag_ipv6.o
+diff --git a/net/ipv6/netfilter/ip6table_filter.c b/net/ipv6/netfilter/ip6table_filter.c
+index 1343077dd..a417331c3 100644
+--- a/net/ipv6/netfilter/ip6table_filter.c
++++ b/net/ipv6/netfilter/ip6table_filter.c
+@@ -18,9 +18,9 @@ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Netfilter Core Team <coreteam@netfilter.org>");
+ MODULE_DESCRIPTION("ip6tables filter table");
+ 
+-#define FILTER_VALID_HOOKS ((1 << NF_INET_LOCAL_IN) | \
+-			    (1 << NF_INET_FORWARD) | \
+-			    (1 << NF_INET_LOCAL_OUT))
++#define FILTER_VALID_HOOKS	((1 << NF_INET_LOCAL_IN) | \
++				(1 << NF_INET_FORWARD) | \
++				(1 << NF_INET_LOCAL_OUT))
+ 
+ static int __net_init ip6table_filter_table_init(struct net *net);
+ 
+@@ -33,7 +33,6 @@ static const struct xt_table packet_filter = {
+ 	.table_init	= ip6table_filter_table_init,
+ };
+ 
+-/* The work comes in here from netfilter.c. */
+ static unsigned int
+ ip6table_filter_hook(void *priv, struct sk_buff *skb,
+ 		     const struct nf_hook_state *state)
+@@ -43,28 +42,131 @@ ip6table_filter_hook(void *priv, struct sk_buff *skb,
+ 
+ static struct nf_hook_ops *filter_ops __read_mostly;
+ 
+-/* Default to forward because I got too much mail already. */
+ static bool forward = true;
+ module_param(forward, bool, 0000);
+ 
+ static int __net_init ip6table_filter_table_init(struct net *net)
+ {
+-	struct ip6t_replace *repl;
+ 	int err;
++	void *buf;
++	struct ip6t_replace *repl;
++	char *data;
++	unsigned int hook_mask, nhooks, hooknum;
++	unsigned int bytes, forward_hook_off, chain_off;
++	size_t std_sz, err_sz, total_sz;
+ 
+ 	if (net->ipv6.ip6table_filter)
+ 		return 0;
+ 
+-	repl = ip6t_alloc_initial_table(&packet_filter);
+-	if (repl == NULL)
++	/*
++	 * Build initial table with tetherctrl_FORWARD and
++	 * tetherctrl_counters chains pre-created for Android 11 netd.
++	 *
++	 * Layout (9 entries):
++	 *   [0] LOCAL_IN  -> ACCEPT (hook+underflow)
++	 *   [1] FORWARD   -> JUMP tetherctrl_FORWARD (hook)
++	 *   [2] FORWARD underflow -> ACCEPT (underflow)
++	 *   [3] LOCAL_OUT -> ACCEPT (hook+underflow)
++	 *   [4] tetherctrl_FORWARD chain head (error target)
++	 *   [5] tetherctrl_FORWARD return -> ACCEPT
++	 *   [6] tetherctrl_counters chain head (error target)
++	 *   [7] tetherctrl_counters return -> ACCEPT
++	 *   [8] ERROR
++	 */
++	std_sz = sizeof(struct ip6t_standard);
++	err_sz = sizeof(struct ip6t_error);
++	hook_mask = packet_filter.valid_hooks;
++	nhooks = hweight32(hook_mask);
++	total_sz = (nhooks + 1) * std_sz + err_sz + std_sz + err_sz + std_sz + err_sz;
++
++	buf = kzalloc(sizeof(*repl) + total_sz, GFP_KERNEL);
++	if (!buf)
+ 		return -ENOMEM;
+-	/* Entry 1 is the FORWARD hook */
+-	((struct ip6t_standard *)repl->entries)[1].target.verdict =
+-		forward ? -NF_ACCEPT - 1 : -NF_DROP - 1;
++
++	repl = buf;
++	data = buf + sizeof(*repl);
++
++	strncpy(repl->name, packet_filter.name, sizeof(repl->name));
++	repl->valid_hooks = hook_mask;
++	repl->num_entries = nhooks + 6;
++	repl->size = total_sz;
++
++	hooknum = 0;
++	bytes = 0;
++	for (; hook_mask != 0; hook_mask >>= 1, ++hooknum) {
++		struct ip6t_standard *e;
++		if (!(hook_mask & 1))
++			continue;
++
++		if (hooknum == NF_INET_FORWARD) {
++			repl->hook_entry[hooknum] = bytes;
++			forward_hook_off = bytes;
++			e = (struct ip6t_standard *)(data + bytes);
++			*e = (struct ip6t_standard)IP6T_STANDARD_INIT(NF_ACCEPT);
++			bytes += std_sz;
++
++			repl->underflow[hooknum] = bytes;
++			e = (struct ip6t_standard *)(data + bytes);
++			*e = (struct ip6t_standard)IP6T_STANDARD_INIT(NF_ACCEPT);
++			bytes += std_sz;
++		} else {
++			repl->hook_entry[hooknum] = bytes;
++			repl->underflow[hooknum] = bytes;
++			e = (struct ip6t_standard *)(data + bytes);
++			*e = (struct ip6t_standard)IP6T_STANDARD_INIT(NF_ACCEPT);
++			bytes += std_sz;
++		}
++	}
++
++	/* tetherctrl_FORWARD chain head */
++	chain_off = bytes;
++	{
++		struct ip6t_error *ch = (struct ip6t_error *)(data + bytes);
++		*ch = (struct ip6t_error)IP6T_ERROR_INIT;
++		strncpy(ch->target.errorname, "tetherctrl_FORWARD",
++			sizeof(ch->target.errorname));
++		bytes += err_sz;
++	}
++
++	/* tetherctrl_FORWARD return */
++	{
++		struct ip6t_standard *r = (struct ip6t_standard *)(data + bytes);
++		*r = (struct ip6t_standard)IP6T_STANDARD_INIT(NF_ACCEPT);
++		bytes += std_sz;
++	}
++
++	/* tetherctrl_counters chain head */
++	{
++		struct ip6t_error *ch = (struct ip6t_error *)(data + bytes);
++		*ch = (struct ip6t_error)IP6T_ERROR_INIT;
++		strncpy(ch->target.errorname, "tetherctrl_counters",
++			sizeof(ch->target.errorname));
++		bytes += err_sz;
++	}
++
++	/* tetherctrl_counters return */
++	{
++		struct ip6t_standard *r = (struct ip6t_standard *)(data + bytes);
++		*r = (struct ip6t_standard)IP6T_STANDARD_INIT(NF_ACCEPT);
++		bytes += std_sz;
++	}
++
++	/* ERROR entry */
++	{
++		struct ip6t_error *t = (struct ip6t_error *)(data + bytes);
++		*t = (struct ip6t_error)IP6T_ERROR_INIT;
++	}
++
++	/* Set FORWARD hook jump to tetherctrl_FORWARD */
++	{
++		struct ip6t_standard *fwd = (struct ip6t_standard *)
++			(data + forward_hook_off);
++		fwd->target.verdict = chain_off;
++	}
+ 
+ 	err = ip6t_register_table(net, &packet_filter, repl, filter_ops,
+ 				  &net->ipv6.ip6table_filter);
+-	kfree(repl);
++	kfree(buf);
+ 	return err;
+ }
+ 
+diff --git a/net/ipv6/netfilter/ip6table_nat.c b/net/ipv6/netfilter/ip6table_nat.c
+index 991512576..eaf167225 100644
+--- a/net/ipv6/netfilter/ip6table_nat.c
++++ b/net/ipv6/netfilter/ip6table_nat.c
+@@ -70,28 +70,24 @@ static unsigned int ip6table_nat_local_fn(void *priv,
+ }
+ 
+ static const struct nf_hook_ops nf_nat_ipv6_ops[] = {
+-	/* Before packet filtering, change destination */
+ 	{
+ 		.hook		= ip6table_nat_in,
+ 		.pf		= NFPROTO_IPV6,
+ 		.hooknum	= NF_INET_PRE_ROUTING,
+ 		.priority	= NF_IP6_PRI_NAT_DST,
+ 	},
+-	/* After packet filtering, change source */
+ 	{
+ 		.hook		= ip6table_nat_out,
+ 		.pf		= NFPROTO_IPV6,
+ 		.hooknum	= NF_INET_POST_ROUTING,
+ 		.priority	= NF_IP6_PRI_NAT_SRC,
+ 	},
+-	/* Before packet filtering, change destination */
+ 	{
+ 		.hook		= ip6table_nat_local_fn,
+ 		.pf		= NFPROTO_IPV6,
+ 		.hooknum	= NF_INET_LOCAL_OUT,
+ 		.priority	= NF_IP6_PRI_NAT_DST,
+ 	},
+-	/* After packet filtering, change source */
+ 	{
+ 		.hook		= ip6table_nat_fn,
+ 		.pf		= NFPROTO_IPV6,
+@@ -102,18 +98,104 @@ static const struct nf_hook_ops nf_nat_ipv6_ops[] = {
+ 
+ static int __net_init ip6table_nat_table_init(struct net *net)
+ {
+-	struct ip6t_replace *repl;
+ 	int ret;
++	void *buf;
++	struct ip6t_replace *repl;
++	char *data;
++	unsigned int hook_mask, nhooks, hooknum;
++	unsigned int bytes, postrouting_hook_off, chain_off;
++	size_t std_sz, err_sz, total_sz;
+ 
+ 	if (net->ipv6.ip6table_nat)
+ 		return 0;
+ 
+-	repl = ip6t_alloc_initial_table(&nf_nat_ipv6_table);
+-	if (repl == NULL)
++	/*
++	 * Build initial table with tetherctrl_nat_POSTROUTING chain.
++	 *
++	 * Layout (8 entries):
++	 *   [0] PREROUTING  -> ACCEPT  (hook+underflow)
++	 *   [1] POSTROUTING -> JUMP tetherctrl_nat_POSTROUTING (hook)
++	 *   [2] POSTROUTING underflow -> ACCEPT (underflow)
++	 *   [3] LOCAL_OUT   -> ACCEPT  (hook+underflow)
++	 *   [4] LOCAL_IN    -> ACCEPT  (hook+underflow)
++	 *   [5] tetherctrl_nat_POSTROUTING chain head (error target)
++	 *   [6] tetherctrl_nat_POSTROUTING return -> ACCEPT
++	 *   [7] ERROR
++	 */
++	std_sz = sizeof(struct ip6t_standard);
++	err_sz = sizeof(struct ip6t_error);
++	hook_mask = nf_nat_ipv6_table.valid_hooks;
++	nhooks = hweight32(hook_mask);
++	total_sz = (nhooks + 1) * std_sz + err_sz + std_sz + err_sz;
++
++	buf = kzalloc(sizeof(*repl) + total_sz, GFP_KERNEL);
++	if (!buf)
+ 		return -ENOMEM;
++
++	repl = buf;
++	data = buf + sizeof(*repl);
++
++	strncpy(repl->name, nf_nat_ipv6_table.name, sizeof(repl->name));
++	repl->valid_hooks = hook_mask;
++	repl->num_entries = nhooks + 4;
++	repl->size = total_sz;
++
++	hooknum = 0;
++	bytes = 0;
++	for (; hook_mask != 0; hook_mask >>= 1, ++hooknum) {
++		struct ip6t_standard *e;
++		if (!(hook_mask & 1))
++			continue;
++
++		if (hooknum == NF_INET_POST_ROUTING) {
++			repl->hook_entry[hooknum] = bytes;
++			postrouting_hook_off = bytes;
++			e = (struct ip6t_standard *)(data + bytes);
++			*e = (struct ip6t_standard)IP6T_STANDARD_INIT(NF_ACCEPT);
++			bytes += std_sz;
++
++			repl->underflow[hooknum] = bytes;
++			e = (struct ip6t_standard *)(data + bytes);
++			*e = (struct ip6t_standard)IP6T_STANDARD_INIT(NF_ACCEPT);
++			bytes += std_sz;
++		} else {
++			repl->hook_entry[hooknum] = bytes;
++			repl->underflow[hooknum] = bytes;
++			e = (struct ip6t_standard *)(data + bytes);
++			*e = (struct ip6t_standard)IP6T_STANDARD_INIT(NF_ACCEPT);
++			bytes += std_sz;
++		}
++	}
++
++	chain_off = bytes;
++	{
++		struct ip6t_error *ch = (struct ip6t_error *)(data + bytes);
++		*ch = (struct ip6t_error)IP6T_ERROR_INIT;
++		strncpy(ch->target.errorname, "tetherctrl_nat_POSTROUTING",
++			sizeof(ch->target.errorname));
++		bytes += err_sz;
++	}
++
++	{
++		struct ip6t_standard *r = (struct ip6t_standard *)(data + bytes);
++		*r = (struct ip6t_standard)IP6T_STANDARD_INIT(NF_ACCEPT);
++		bytes += std_sz;
++	}
++
++	{
++		struct ip6t_error *t = (struct ip6t_error *)(data + bytes);
++		*t = (struct ip6t_error)IP6T_ERROR_INIT;
++	}
++
++	{
++		struct ip6t_standard *po = (struct ip6t_standard *)
++			(data + postrouting_hook_off);
++		po->target.verdict = chain_off;
++	}
++
+ 	ret = ip6t_register_table(net, &nf_nat_ipv6_table, repl,
+ 				  nf_nat_ipv6_ops, &net->ipv6.ip6table_nat);
+-	kfree(repl);
++	kfree(buf);
+ 	return ret;
+ }
+ 

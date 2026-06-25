@@ -8,7 +8,7 @@ WiFi hotspot starts (AP appears on other devices, `hostapd` runs), then **immedi
 
 ## Root causes
 
-Two independent problems combined to break tethering:
+Three independent problems combined to break tethering:
 
 ### 1. IPv6 NAT support missing from kernel
 
@@ -20,12 +20,6 @@ Two independent problems combined to break tethering:
 - `netd`'s `IptablesRestoreController` keeps a persistent pipe to `ip6tables-restore` — once the process dies, the pipe is broken
 - All subsequent `ip6tables` operations through the pipe return `EREMOTEIO (code 121)` — "Remote I/O error"
 - This also corrupts the `iptables-restore` (IPv4) pipe because netd's restore controller manages both
-
-**Evidence from device:**
-```
-$ ip6tables -t nat -L
-ip6tables v1.8.4 (legacy): can't initialize ip6tables table `nat': Table does not exist (do you need to insmod?)
-```
 
 ### 2. IptablesRestoreController tetherctrl chain bug in Android 11 netd
 
@@ -40,85 +34,101 @@ This mixes `iptables-restore` table syntax (`*filter`, `COMMIT`) with `iptables`
 
 **When it fails:** If the `tetherctrl_counters` chain does not exist when this command is sent, `iptables-restore` fails with `line 2 failed` and **exits with code 1** (status=256). The process dies. Netd does not restart it.
 
-**Evidence from logcat:**
-```
-W IptablesRestoreController: iptables-restore process 11021 terminated status=256
-E IptablesRestoreController: ------- COMMAND -------
-E IptablesRestoreController: *filter
-E IptablesRestoreController: -nvx -L tetherctrl_counters
-E IptablesRestoreController: COMMIT
-E IptablesRestoreController: -------  ERROR -------
-E IptablesRestoreController: iptables-restore: line 2 failed
-```
-
 **Cascade effect:** Once `iptables-restore` dies, the tethering sequence fails:
 ```
-[wlan0] ERROR Exception enabling NAT: android.os.ServiceSpecificException: Remote I/O error (code 121)
-[wlan0] ERROR Exception in ipfwdRemoveInterfaceForward: No such file or directory (code 2)
+E/TetherController: Error setting forward rules
+E/Tethering: [wlan0] ERROR Exception enabling NAT: No such device (code 19)
+E/Tethering: [wlan0] ERROR Exception in ipfwdRemoveInterfaceForward: No such file or directory (code 2)
 OBSERVED iface=wlan0 state=1 error=8
 Canceling WiFi tethering request
 ```
 
-The same happens for `ip6tables-restore` — netd sends the same `-nvx -L tetherctrl_counters` command through the IPv6 pipe.
+### 3. IPv6 NAT built-in (`=y`) crash — Makefile link order
 
-## Fix
+Initial attempt to set `CONFIG_NF_NAT_IPV6=y` (built-in) caused kernel crashdump. Investigation revealed this was **not** a code bug but a **Makefile link order** problem.
 
-### Part 1: Enable IPv6 NAT as kernel modules
+**Root cause:** In `net/ipv6/netfilter/Makefile`, `ip6table_nat.o` was linked **before** `nf_nat_ipv6.o` and `nf_nat_masquerade_ipv6.o`. The `ip6table_nat` init code calls functions from `nf_nat_ipv6` during `register_pernet_subsys()`, but those symbols weren't yet initialized at link time. This caused a crash during early kernel init.
 
-Added to `kirisakura_defconfig` / `.config`:
+**Fix:** Reordered `Makefile` to match the IPv4 link order — `nf_nat_ipv6.o` and `nf_nat_masquerade_ipv6.o` are now linked **before** `ip6table_nat.o`. This is the same order used by `net/ipv4/netfilter/Makefile` for IPv4 NAT, which works correctly.
+
+## Fix — v2.2 (fully kernel-level)
+
+All three problems are fixed entirely in the kernel. **No KSU module, no userspace script, no `insmod` required.**
+
+### Part 1: IPv6 NAT built-in (`=y`) + Makefile link order fix
+
 ```
-CONFIG_NF_NAT_IPV6=m
-CONFIG_NF_NAT_MASQUERADE_IPV6=m
-CONFIG_IP6_NF_NAT=m
-CONFIG_IP6_NF_TARGET_MASQUERADE=m
-```
-
-Built as **modules** (`=m`), not built-in (`=y`).
-
-**Why not `=y` (built-in)?**
-
-`CONFIG_NF_NAT_IPV6=y` causes kernel crashdump on Qualcomm SDM855 (SM8150) arm64 4.14.243. Two separate boot attempts both resulted in crashdump mode requiring fastboot recovery.
-
-The crash occurs during `module_init` → `nf_nat_l3proto_ipv6_init()` → `nf_nat_l3proto_register()` or `ip6table_nat_init()` → `register_pernet_subsys()`. The exact root cause is unknown — it may be a conflict between netfilter hook registration and Qualcomm's custom network stack during early kernel init.
-
-Building as modules (`=m`) avoids the issue: the init code runs later via `insmod` after the system is fully booted, when the network stack is stable.
-
-### Part 2: KSU module for boot-time setup
-
-A KernelSU module (`ipv6nat`) runs `post-fs-data.sh` at boot, **before netd starts**:
-
-```bash
-#!/system/bin/sh
-MODDIR="/data/adb/modules/ipv6nat"
-
-# 1. Load IPv6 NAT modules (dependency order)
-insmod "$MODDIR/modules/nf_nat_ipv6.ko"
-insmod "$MODDIR/modules/nf_nat_masquerade_ipv6.ko"
-insmod "$MODDIR/modules/ip6table_nat.ko"
-insmod "$MODDIR/modules/ip6t_MASQUERADE.ko"
-
-# 2. Pre-create tetherctrl chains in BOTH iptables and ip6tables
-for BIN in iptables ip6tables; do
-    $BIN -N tetherctrl_counters 2>/dev/null
-    $BIN -N tetherctrl_FORWARD 2>/dev/null
-    $BIN -t nat -N tetherctrl_nat_POSTROUTING 2>/dev/null
-    $BIN -C FORWARD -j tetherctrl_FORWARD 2>/dev/null || $BIN -A FORWARD -j tetherctrl_FORWARD
-    $BIN -t nat -C POSTROUTING -j tetherctrl_nat_POSTROUTING 2>/dev/null || $BIN -t nat -A POSTROUTING -j tetherctrl_nat_POSTROUTING
-done
+CONFIG_NF_NAT_IPV6=y
+CONFIG_NF_NAT_MASQUERADE_IPV6=y
+CONFIG_IP6_NF_NAT=y
+CONFIG_IP6_NF_TARGET_MASQUERADE=y
 ```
 
-**Step 1** ensures the `ip6tables -t nat` table exists before netd tries to start `ip6tables-restore`.
+**Makefile fix** (`net/ipv6/netfilter/Makefile`):
+```makefile
+# Before (broken): ip6table_nat.o linked BEFORE its dependencies
+obj-$(CONFIG_IP6_NF_NAT) += ip6table_nat.o
+obj-$(CONFIG_NF_NAT_IPV6) += nf_nat_ipv6.o
+...
 
-**Step 2** ensures the `tetherctrl_counters` chain exists in both IPv4 and IPv6 iptables before netd sends the `-nvx -L tetherctrl_counters` command through the restore pipes. With the chain pre-existing, `iptables-restore` succeeds (returns the chain contents) instead of crashing.
+# After (fixed): dependencies linked FIRST, matching IPv4 order
+obj-$(CONFIG_NF_NAT_IPV6) += nf_nat_ipv6.o
+obj-$(CONFIG_NF_NAT_MASQUERADE_IPV6) += nf_nat_masquerade_ipv6.o
+obj-$(CONFIG_IP6_NF_NAT) += ip6table_nat.o
+...
+```
+
+### Part 2: tetherctrl chains pre-created in kernel initial table structure
+
+The key insight: user-defined chains in iptables/ip6tables are stored as `ip6t_error` entries with the `errorname` field set to the chain name. By embedding these entries directly in the kernel's initial table `replace` structure, the chains exist from the moment the table is registered — before any userspace process runs.
+
+**Three files modified:**
+
+#### `net/ipv6/netfilter/ip6table_nat.c`
+
+Custom `ip6table_nat_table_init()` builds a `struct ip6t_replace` with:
+- `POSTROUTING` hook entry → JUMP to `tetherctrl_nat_POSTROUTING` (positive verdict = byte offset)
+- Separate `POSTROUTING` underflow entry → ACCEPT (negative verdict)
+- `tetherctrl_nat_POSTROUTING` chain head (`ip6t_error` entry with errorname)
+- `tetherctrl_nat_POSTROUTING` return → ACCEPT
+- `ERROR` entry
+
+#### `net/ipv6/netfilter/ip6table_filter.c`
+
+Custom `ip6table_filter_table_init()` builds a `struct ip6t_replace` with:
+- `INPUT` hook → ACCEPT
+- `FORWARD` hook → JUMP to `tetherctrl_FORWARD` (positive verdict = byte offset)
+- `FORWARD` underflow → ACCEPT (separate entry, required by `check_underflow()`)
+- `OUTPUT` hook → ACCEPT
+- `tetherctrl_FORWARD` chain head + return
+- `tetherctrl_counters` chain head + return
+- `ERROR` entry
+
+#### `net/ipv4/netfilter/iptable_filter.c`
+
+Custom `iptable_filter_table_init()` builds a `struct ipt_replace` with:
+- `INPUT`, `FORWARD`, `OUTPUT` hooks → standard ACCEPT/DROP
+- `tetherctrl_counters` chain head + return
+- `ERROR` entry
+
+This was the **critical missing piece** — Android 11 netd's `TetherController::setForwardRules()` sends `iptables-restore` commands that use `-g tetherctrl_counters` (goto). Without the chain pre-existing in the IPv4 filter table, `iptables-restore` fails with `goto 'tetherctrl_counters' is not a chain` and the entire tethering sequence aborts.
+
+### Implementation details
+
+**Byte-offset pointer arithmetic:** The `ip6t_error` struct is larger than `ip6t_standard` (it has an extra `errorname` field). Mixed-type arrays can't use array indexing, so entries are placed at computed byte offsets within a flat buffer. Jump verdicts are positive integers representing the byte offset of the target entry from the start of the entries data.
+
+**`check_underflow()` requirement:** Kernel's `check_underflow()` validates that underflow entries (the fallback for a hook when all rules miss) have **negative** verdicts (ACCEPT/DROP/RETURN). Hook entries that JUMP to a user chain have **positive** verdicts (byte offset). Therefore, hooks that jump must have a **separate** underflow entry with a negative verdict.
+
+**`IPT_STANDARD_INIT` / `IP6T_STANDARD_INIT` macro:** The macro already applies `-verdict - 1`, so callers must pass `NF_ACCEPT` (not `-NF_ACCEPT - 1`). Passing `-NF_ACCEPT - 1` causes double-negation → verdict = 1 (jump to byte offset 1) → garbage → table registration fails silently.
 
 ## Verification
 
-After fix, hotspot starts and stays up:
+After fix, hotspot starts and stays up — no KSU module, no userspace script:
 
 ```
 $ dumpsys tethering | grep -E "TETHERED|error="
 OBSERVED iface=wlan0 state=2 error=0
-OBSERVED LinkProperties update iface=wlan0 state=TETHERED lp={...192.168.15.40/24...}
+OBSERVED LinkProperties update iface=wlan0 state=TETHERED lp={...192.168.59.54/24...}
 
 $ cat /proc/sys/net/ipv4/ip_forward
 1
@@ -127,35 +137,40 @@ $ iptables -t nat -L tetherctrl_nat_POSTROUTING
 Chain tetherctrl_nat_POSTROUTING (1 references)
 MASQUERADE  all  --  anywhere  anywhere
 
+$ ip6tables -t nat -L tetherctrl_nat_POSTROUTING
+Chain tetherctrl_nat_POSTROUTING (1 references)
+
+$ iptables -L tetherctrl_counters
+Chain tetherctrl_counters (2 references)
+RETURN  all  --  wlan0  rmnet_data2  anywhere  anywhere
+RETURN  all  --  rmnet_data2  wlan0  anywhere  anywhere
+
+$ ip6tables -L tetherctrl_counters
+Chain tetherctrl_counters (1 references)
+RETURN  all      wlan0  rmnet_data2  anywhere  anywhere
+RETURN  all      rmnet_data2  wlan0   anywhere  anywhere
+
+$ lsmod
+Module                  Size  Used by
+(empty — everything built-in)
+
 $ logcat | grep hostapd
 hostapd: wlan0: AP-STA-CONNECTED fe:dd:f1:e0:44:be
 hostapd: wlan0: STA fe:dd:f1:e0:44:be WPA: pairwise key handshake completed
 ```
 
-## Module structure
+## Evolution
 
-```
-ipv6nat-boot-module.zip
-├── module.prop
-├── post-fs-data.sh          # loads modules + creates chains at boot
-└── modules/
-    ├── nf_nat_ipv6.ko        # 704 KB
-    ├── nf_nat_masquerade_ipv6.ko  # 369 KB
-    ├── ip6table_nat.ko       # 351 KB
-    └── ip6t_MASQUERADE.ko    # 340 KB
-```
+| Version | IPv6 NAT | tetherctrl chains | KSU module needed |
+|---|---|---|---|
+| v2.0 | Not supported | Not present | N/A (hotspot broken) |
+| v2.1 | Loadable modules (`=m`) | Created by KSU `post-fs-data.sh` | Yes (`ipv6nat`) |
+| **v2.2** | **Built-in (`=y`)** | **Pre-created in kernel initial table** | **No** |
 
-## Why not fix this entirely in the kernel?
+## Patch file
 
-| Component | In kernel? | Why |
-|---|---|---|
-| IPv6 NAT code | Yes | `CONFIG_NF_NAT_IPV6=m` — kernel provides the code |
-| Module loading | No | `insmod` is a userspace operation |
-| `tetherctrl_counters` chain | No | User-defined chains are created by userspace (`iptables -N`) |
-| `iptables-restore` pipe management | No | Netd (userspace daemon) manages the pipe |
-
-The kernel provides the netfilter framework, but chain creation and module loading are userspace operations. The KSU module bridges this gap at boot time.
-
-## Future improvement
-
-If the `CONFIG_NF_NAT_IPV6=y` crashdump root cause is found and fixed, the modules could be built-in and the `insmod` step removed. The tetherctrl chain pre-creation would still be needed (it's a netd bug, not a kernel issue).
+See `tetherctrl-builtin.patch` for the complete diff of all 4 modified files:
+- `net/ipv4/netfilter/iptable_filter.c` — IPv4 filter: pre-create `tetherctrl_counters`
+- `net/ipv6/netfilter/ip6table_filter.c` — IPv6 filter: pre-create `tetherctrl_FORWARD` + `tetherctrl_counters`
+- `net/ipv6/netfilter/ip6table_nat.c` — IPv6 nat: pre-create `tetherctrl_nat_POSTROUTING` + jump from POSTROUTING
+- `net/ipv6/netfilter/Makefile` — link order fix (dependencies before consumers)

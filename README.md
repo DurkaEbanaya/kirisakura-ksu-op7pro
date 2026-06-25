@@ -1,12 +1,61 @@
 # Kirisakura-KSU-Next — OnePlus 7 Pro (guacamole)
 
-Custom kernel **Kirisakura 4.14.243** with **KernelSU-Next v3.1.0-legacy** (version 33024), **161 security patches** from linux-4.14.244–4.14.336, and **built-in VPNHide** for OnePlus 7 Pro on stock OxygenOS 11 (`GM1910_21_220617`, Android 11).
+Custom kernel **Kirisakura 4.14.243** with **KernelSU-Next v3.1.0-legacy** (version 33024), **161 security patches** from linux-4.14.244–4.14.336, **built-in VPNHide**, and **fully kernel-level WiFi hotspot fix** for OnePlus 7 Pro on stock OxygenOS 11 (`GM1910_21_220617`, Android 11).
 
-**Working:** Root (KSU Next) · FOD fingerprint · WiFi · Bluetooth · SELinux Enforcing · WiFi Hotspot/Tethering · VPN interface hiding
+**Working:** Root (KSU Next) · FOD fingerprint · WiFi · Bluetooth · SELinux Enforcing · WiFi Hotspot/Tethering (no module needed) · VPN interface hiding
 
 ---
 
-## What's new in v2.1
+## What's new in v2.2
+
+### WiFi Hotspot / Tethering — fully kernel-level, no KSU module
+
+v2.1 required a KSU module (`ipv6nat`) with `post-fs-data.sh` to load `.ko` modules and create iptables chains at boot. **v2.2 eliminates the module entirely** — everything is now in the kernel:
+
+| What | v2.1 | v2.2 |
+|---|---|---|
+| IPv6 NAT | Loadable modules (`=m`) + `insmod` via KSU | **Built-in (`=y`)** — no `insmod` |
+| tetherctrl chains | Created by `post-fs-data.sh` (`iptables -N`) | **Pre-created in kernel initial table** — exist from boot |
+| KSU module required | Yes (`ipv6nat`) | **No** |
+| `.ko` files needed | 4 files (~1.7 MB) | **0** |
+| `lsmod` after boot | 4 modules | **Empty** |
+
+**Three root causes fixed at kernel level:**
+
+1. **IPv6 NAT Makefile link order** (`net/ipv6/netfilter/Makefile`) — `ip6table_nat.o` was linked before its dependencies (`nf_nat_ipv6.o`, `nf_nat_masquerade_ipv6.o`). Reordered to match IPv4's link order. `CONFIG_NF_NAT_IPV6=y` now works without crashdump.
+
+2. **tetherctrl chains in initial table** (3 source files) — user-defined chains are `ip6t_error`/`ipt_error` entries with `errorname` set to the chain name. By embedding them in the kernel's initial `replace` structure, chains exist from the moment the table is registered — before any userspace process runs. Jump entries use byte-offset verdicts (positive integers) to point at the chain head.
+
+3. **IPv4 `tetherctrl_counters`** (`net/ipv4/netfilter/iptable_filter.c`) — the critical missing piece. Android 11 netd's `TetherController::setForwardRules()` sends `iptables-restore` commands with `-g tetherctrl_counters` (goto). Without the chain in the IPv4 filter table, `iptables-restore` fails with `goto 'tetherctrl_counters' is not a chain` and the entire tethering sequence aborts.
+
+See [HOTSPOT-FIX.md](HOTSPOT-FIX.md) for the full diagnosis and `tetherctrl-builtin.patch` for the complete diff.
+
+### CRITICAL: Boot image must be uncompressed (`CONFIG_BUILD_ARM64_UNCOMPRESSED_KERNEL=y`)
+
+The OnePlus 7 Pro boot partition expects a **raw uncompressed `Image`**, not a GZIP-compressed `Image.gz`. Without `CONFIG_BUILD_ARM64_UNCOMPRESSED_KERNEL=y`:
+
+- The kernel builds as `arch/arm64/boot/Image.gz` (GZIP-compressed)
+- `magiskboot repack` packs it into the boot image
+- The bootloader cannot decompress it → **bootloop** (device vibrates, shows OnePlus logo, reboots)
+- No error message, no crashdump — just an infinite reboot loop
+
+**Always verify** `CONFIG_BUILD_ARM64_UNCOMPRESSED_KERNEL=y` is set in your defconfig before building. The boot image should contain a raw `Image` (~55 MB for this kernel), not `Image.gz` (~20 MB).
+
+```
+# Correct (v2.2):
+KERNEL_FMT      [raw]
+KERNEL_SZ       [54974480]    # ~55 MB — uncompressed
+
+# Wrong (bootloop):
+KERNEL_FMT      [gzip]
+KERNEL_SZ       [19478892]    # ~19 MB — compressed, will bootloop
+```
+
+---
+
+## What's new in v2.1 (superseded by v2.2)
+
+> **v2.1 used loadable modules (`=m`) and a KSU module for hotspot. v2.2 replaces this with a fully kernel-level solution — see above.**
 
 ### Built-in VPNHide (CONFIG_VPNHIDE=y)
 
@@ -29,7 +78,9 @@ VPN interface hiding compiled directly into the kernel — no kprobes, no loadab
 
 Install the [VPN Hide app](https://github.com/okhsunrog/vpnhide) for GUI management of target apps and diagnostics.
 
-### WiFi Hotspot / Tethering fix
+### WiFi Hotspot / Tethering fix (v2.1 approach — superseded by v2.2)
+
+> **This section describes the v2.1 approach. v2.2 fixes everything in the kernel — see [What's new in v2.2](#whats-new-in-v22).**
 
 The stock Kirisakura kernel config had `CONFIG_NF_NAT_IPV6=n` — IPv6 NAT support was completely absent. This broke WiFi hotspot/tethering on Android 11:
 
@@ -44,9 +95,9 @@ The stock Kirisakura kernel config had `CONFIG_NF_NAT_IPV6=n` — IPv6 NAT suppo
 | IPv6 NAT kernel support | `CONFIG_NF_NAT_IPV6=m`, `CONFIG_NF_NAT_MASQUERADE_IPV6=m`, `CONFIG_IP6_NF_NAT=m`, `CONFIG_IP6_NF_TARGET_MASQUERADE=m` (loadable modules) | Built-in (`=y`) crashes the kernel on Qualcomm arm64 4.14 during `nf_nat_l3proto_ipv6_init()`. Modules load fine at boot via KSU. |
 | tetherctrl chain pre-creation | KSU module `post-fs-data.sh` creates `tetherctrl_counters`, `tetherctrl_FORWARD`, `tetherctrl_nat_POSTROUTING` chains in both `iptables` and `ip6tables` before netd starts | Android 11 netd sends `-nvx -L tetherctrl_counters` via `iptables-restore` pipe. If the chain doesn't exist, `iptables-restore` exits with error and dies. Netd doesn't restart it → all tethering NAT setup fails. |
 
-**Why built-in IPv6 NAT crashes:**
+**Why built-in IPv6 NAT "crashed" in v2.1 (now fixed in v2.2):**
 
-`CONFIG_NF_NAT_IPV6=y` causes kernel crashdump on Qualcomm SDM855 (SM8150) arm64 4.14.243. The crash occurs during `module_init` → `nf_nat_l3proto_ipv6_init()` → `nf_nat_l3proto_register()` or `ip6table_nat_init()` → `register_pernet_subsys()`. Two separate boot attempts both resulted in crashdump mode. Root cause unknown — possibly a conflict between netfilter hook registration and Qualcomm's custom network stack during early init. Building as modules (`=m`) avoids the issue because init runs later via `insmod` after the system is fully booted.
+The v2.1 crash was **not** a code bug — it was a **Makefile link order** problem. In `net/ipv6/netfilter/Makefile`, `ip6table_nat.o` was linked before its dependencies (`nf_nat_ipv6.o`, `nf_nat_masquerade_ipv6.o`). Reordering to match IPv4's link order fixed it. See [HOTSPOT-FIX.md](HOTSPOT-FIX.md) for details.
 
 See [HOTSPOT-FIX.md](HOTSPOT-FIX.md) for the full diagnosis process.
 
@@ -76,10 +127,11 @@ The stock OnePlus 7 Pro kernel (4.14.190) works fine, but there was no KSU-Next 
 | Defconfig | `stock_defconfig` (pure OnePlus stock, no CFI/LTO/SCS) |
 | KernelSU-Next | v3.1.0-legacy, version 33024, manual hooks |
 | VPNHide | Built-in (`CONFIG_VPNHIDE=y`) — 11 kernel hooks, no kprobes |
-| IPv6 NAT | Loadable modules (`CONFIG_NF_NAT_IPV6=m`) — required for hotspot |
+| IPv6 NAT | **Built-in (`CONFIG_NF_NAT_IPV6=y`)** — required for hotspot, no modules |
 | FOD | Stock OOS path preserved — no `fod_property`, no `dimlayer_hbm` boolean, original `fppressed_index` plane-alpha handling |
 | Wi-Fi (qcacld-3.0) | Built-in (`CONFIG_QCA_CLD_WLAN=y`) — no external module needed |
-| WiFi Hotspot | Working with KSU module (IPv6 NAT modules + tetherctrl chain pre-creation) |
+| WiFi Hotspot | **Working without any KSU module** — tetherctrl chains pre-created in kernel initial table |
+| Boot image format | **Uncompressed** (`CONFIG_BUILD_ARM64_UNCOMPRESSED_KERNEL=y`) — raw `Image`, not GZIP |
 | MODULE_SIG_FORCE | Disabled — allows loading unsigned modules |
 | SELinux | Enforcing (stock) — `selinux_state` moved from `__rticdata` to regular `.bss` |
 | KALLSYMS | Absolute mode (`KALLSYMS_BASE_RELATIVE` disabled — kernel image too large for relative mode with security patches + WiFi built-in) |
@@ -163,11 +215,12 @@ The Goodix driver was **byte-identical** between LineageOS and stock — the dis
 | File | Description |
 |---|---|
 | `manual-hooks.patch` | 7 KSU-Next manual hooks (git diff) |
-| `kernel.config` | Final `.config` used for the build (includes `CONFIG_VPNHIDE=y`, IPv6 NAT modules) |
+| `tetherctrl-builtin.patch` | 4-file diff: built-in IPv6 NAT + tetherctrl chains in kernel initial tables |
+| `kernel.config` | Final `.config` used for the build (includes `CONFIG_VPNHIDE=y`, IPv6 NAT `=y`, `CONFIG_BUILD_ARM64_UNCOMPRESSED_KERNEL=y`) |
 | `build.sh` | Full automated build script (Docker-based, Clang 14) |
 | `security-patches-shas.txt` | 161 SHA-1 hashes of cherry-picked commits |
 | `SECURITY-PATCHES.md` | Full changelog of security patches with CVEs and subsystems |
-| `HOTSPOT-FIX.md` | WiFi hotspot/tethering fix — full diagnosis and solution |
+| `HOTSPOT-FIX.md` | WiFi hotspot/tethering fix — full diagnosis and solution (v2.2 kernel-level) |
 | `CHANGELOG.md` | Version history |
 
 Prebuilt boot image and manager APK are in [Releases](../../releases).
@@ -185,31 +238,28 @@ Prebuilt boot image and manager APK are in [Releases](../../releases).
 
 ```bash
 # Download from Releases:
-# - kirisakura-vpnhide-ipv6nat-boot.img.xz   (v2.1 boot image with VPNHide + IPv6 NAT)
-# - KernelSU-Next-manager-v3.1.0.apk.xz       (manager app)
-# - ipv6nat-boot-module.zip                   (KSU module for hotspot fix)
-# - vpnhide-builtin-module.zip                (KSU module for VPNHide management)
+# - kirisakura-v2.2-boot.img.xz          (v2.2 boot image — all features built-in)
+# - KernelSU-Next-manager-v3.1.0.apk.xz   (manager app)
+# - vpnhide-builtin-module.zip            (KSU module for VPNHide target management)
 
 # Decompress boot image
-xz -d kirisakura-vpnhide-ipv6nat-boot.img.xz
+xz -d kirisakura-v2.2-boot.img.xz
 
 # Flash kernel to active slot
 adb reboot bootloader
-fastboot flash boot_b kirisakura-vpnhide-ipv6nat-boot.img
+fastboot flash boot_b kirisakura-v2.2-boot.img
 fastboot reboot
 
 # Install manager
 adb install KernelSU-Next-manager-v3.1.0.apk
 
-# Install KSU modules (required for hotspot + vpnhide management)
-adb push ipv6nat-boot-module.zip /data/local/tmp/
+# Install VPNHide management module (optional — only for VPNHide target management)
 adb push vpnhide-builtin-module.zip /data/local/tmp/
-adb shell "su -c 'ksud module install /data/local/tmp/ipv6nat-boot-module.zip'"
 adb shell "su -c 'ksud module install /data/local/tmp/vpnhide-builtin-module.zip'"
-
-# Reboot to activate modules
 adb reboot
 ```
+
+> **Note:** As of v2.2, **no KSU module is needed for hotspot/tethering**. IPv6 NAT and all tetherctrl chains are built directly into the kernel. The only optional KSU module is `vpnhide-builtin-module.zip` for managing VPNHide target app UIDs.
 
 ### Configure VPNHide
 
@@ -260,9 +310,13 @@ adb shell "ip addr show wlan0"
 adb shell "su -c 'cat /proc/vpnhide_targets'"
 # (lists target UIDs)
 
-# IPv6 NAT modules (hotspot)
-adb shell "su -c 'lsmod | grep nat'"
-# ip6table_nat, nf_nat_masquerade_ipv6, nf_nat_ipv6
+# IPv6 NAT (built-in, no modules)
+adb shell "su -c 'lsmod'"
+# (empty — everything is built-in)
+
+adb shell "su -c 'ip6tables -t nat -L'"
+# Chain POSTROUTING (policy ACCEPT)
+# tetherctrl_nat_POSTROUTING  all  anywhere  anywhere
 
 # Fingerprint
 adb shell "dumpsys fingerprint"
