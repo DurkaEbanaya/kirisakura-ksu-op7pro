@@ -37,7 +37,8 @@
   - `modules/ipv6nat/` directory removed from repo
 
 ### Known limitations
-- VPNHide hides VPN at native/kernel level only — Java API level (`ConnectivityManager.hasTransport(VPN)`) requires LSPosed or Zygisk
+- VPNHide kernel hooks hide VPN at native level only — Java API level (`ConnectivityManager.hasTransport(VPN)`) requires LSPosed hooks (see [LSPOSED-AND-INTEGRITY.md](LSPOSED-AND-INTEGRITY.md))
+- STRONG Play Integrity depends on a valid keybox.xml that will eventually be revoked by Google — see [LSPOSED-AND-INTEGRITY.md](LSPOSED-AND-INTEGRITY.md) for keybox management
 - `tetherctrl-builtin.patch` uses byte-offset pointer arithmetic (not array indexing) because `ip6t_error` is larger than `ip6t_standard` — mixed types in a contiguous buffer require manual offset management
 
 ---

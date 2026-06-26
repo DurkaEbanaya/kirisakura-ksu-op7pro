@@ -2,7 +2,9 @@
 
 Custom kernel **Kirisakura 4.14.243** with **KernelSU-Next v3.1.0-legacy** (version 33024), **161 security patches** from linux-4.14.244–4.14.336, **built-in VPNHide**, and **fully kernel-level WiFi hotspot fix** for OnePlus 7 Pro on stock OxygenOS 11 (`GM1910_21_220617`, Android 11).
 
-**Working:** Root (KSU Next) · FOD fingerprint · WiFi · Bluetooth · SELinux Enforcing · WiFi Hotspot/Tethering (no module needed) · VPN interface hiding
+**Working:** Root (KSU Next) · FOD fingerprint · WiFi · Bluetooth · SELinux Enforcing · WiFi Hotspot/Tethering (no module needed) · VPN interface hiding (kernel + Java) · Play Integrity (BASIC + DEVICE + STRONG)
+
+See [LSPOSED-AND-INTEGRITY.md](LSPOSED-AND-INTEGRITY.md) for the LSPosed Java hooks setup and Play Integrity bypass guide.
 
 ---
 
@@ -221,6 +223,7 @@ The Goodix driver was **byte-identical** between LineageOS and stock — the dis
 | `security-patches-shas.txt` | 161 SHA-1 hashes of cherry-picked commits |
 | `SECURITY-PATCHES.md` | Full changelog of security patches with CVEs and subsystems |
 | `HOTSPOT-FIX.md` | WiFi hotspot/tethering fix — full diagnosis and solution (v2.2 kernel-level) |
+| `LSPOSED-AND-INTEGRITY.md` | LSPosed Java hooks for VPNHide + Play Integrity bypass (TrickyStore + IntegrityBox) |
 | `CHANGELOG.md` | Version history |
 
 Prebuilt boot image and manager APK are in [Releases](../../releases).
