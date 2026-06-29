@@ -1,6 +1,0 @@
-id=vpn-tether
-name=VPN Tether
-version=v1.0
-versionCode=1
-author=DurkaEbanaya
-description=Share VPN tunnel with tethered devices. Concurrent WiFi AP without dropping STA connection. One-button VPN grant per device.

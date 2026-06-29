@@ -25,19 +25,12 @@ adb reboot
 - Install the [VPN Hide app](https://github.com/okhsunrog/vpnhide) for GUI management, or
 - Edit `/data/adb/vpnhide_kmod/targets.txt` (one package name per line), then reboot
 
-## vpn-tether — VPN Sharing + Concurrent WiFi AP
+## vpn-tether — Moved to separate repo
 
-Shares VPN tunnel with tethered devices without dropping WiFi connection. Creates a concurrent AP interface (`wlan_ap0`) while WiFi stays connected as STA. One-button VPN grant per device via WebUI.
+VPN Tether is now a standalone project, independent of this kernel:
 
-**Features:**
-- Concurrent WiFi AP — WiFi stays connected while sharing
-- Per-device VPN grant — route specific device's traffic through VPN tunnel
-- Provider DNS — works in whitelist-restricted networks (no 8.8.8.8)
-- USB/BT tether support — grant VPN for USB/Bluetooth tethered devices
-- WebUI with Fluent Design — manage everything from KernelSU Next Manager
+**Repo:** [DurkaEbanaya/vpn-tether](https://github.com/DurkaEbanaya/vpn-tether)
 
-**Install:** Flash `vpn-tether-v1.0.zip` in KSU Next Manager
-
-See [vpn-tether/README.md](vpn-tether/README.md) for details.
+It works on any device with KernelSU — not specific to Kirisakura kernel.
 
 > **Note:** The `ipv6nat` module from v2.1 is **no longer needed** as of v2.2. IPv6 NAT and all tetherctrl chains are now built directly into the kernel — no userspace module required for hotspot/tethering.
