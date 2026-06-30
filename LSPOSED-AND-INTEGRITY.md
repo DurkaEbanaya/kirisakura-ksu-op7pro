@@ -1,9 +1,12 @@
-# LSPosed Java Hooks & Play Integrity Bypass
+# LSPosed Java Hooks, Play Integrity Bypass, Ozon Fix & DNS Configuration
 
-This document covers two post-install configurations for the Kirisakura-KSU-Next kernel on OnePlus 7 Pro (OOS 11):
+This document covers post-install configurations for the Kirisakura-KSU-Next kernel on OnePlus 7 Pro (OOS 11):
 
 1. **Enabling LSPosed Java hooks for VPNHide** — completing the two-level VPN hiding architecture
-2. **Bypassing Play Integrity** — passing BASIC, DEVICE, and STRONG integrity checks with unlocked bootloader
+2. **Bypassing Play Integrity** — passing BASIC and DEVICE integrity checks with unlocked bootloader
+3. **Ozon "No Connection" fix** — TrustMeAlready LSPosed module breaking SSL in Ozon
+4. **DNS / Private DNS configuration** — Tele2 DNS servers do not support DoT
+5. **verifiedbootstate & resetprop_if_diff bug** — IntegrityBox prop spoofing bug on OnePlus 7 Pro
 
 Both are userspace-only — no kernel changes required. The kernel already provides the foundation: built-in VPNHide (`CONFIG_VPNHIDE=y`) for native-level hiding, and KSU-Next for root.
 
@@ -307,7 +310,7 @@ Two modules work together:
 │       │                                                  │
 │       ▼  Modified certificate chain                      │
 │  Google servers verify: device looks locked, certified   │
-│  Result: DEVICE ✅, STRONG ✅ (if keybox valid)          │
+│  Result: DEVICE ✅, STRONG ❌ (public keybox revoked — see keybox table below)          │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -319,7 +322,9 @@ IntegrityBox (module ID: `playintegrityfix`) handles everything TrickyStore does
 
 | Feature | What it does |
 |---|---|
-| Prop spoofing | `ro.boot.flash.locked` → `locked`, `ro.boot.verifiedbootstate` → empty, `ro.boot.vbmeta.device_state` → empty |
+| Prop spoofing | `ro.boot.flash.locked` → `1`, `ro.boot.verifiedbootstate` → `green`, `ro.boot.vbmeta.device_state` → `locked` |
+
+> **OnePlus 7 Pro caveat:** `ro.boot.verifiedbootstate` does not exist in kernel bootargs on this device. IntegrityBox's `resetprop_if_diff` function has a bug that skips setting non-existent props (see [Part 5](#part-5-verifiedbootstate--resetprop_if_diff-bug) below). Props must be set manually via `resetprop -n` after each boot.
 | Security patch spoofing | `ro.build.version.security_patch` and `ro.vendor.build.security_patch` → recent date |
 | Build tag spoofing | Removes `debug` / `test-keys` tags |
 | SELinux spoofing | Reports `enforcing` even if permissive |
@@ -383,10 +388,12 @@ adb shell "su -c 'getprop ro.boot.flash.locked'"
 # locked
 
 adb shell "su -c 'getprop ro.boot.verifiedbootstate'"
-# (empty — IntegrityBox clears this)
+# green (if IntegrityBox set it, or manually via resetprop -n)
+# If empty, set manually:
+# adb shell "su -c '/data/adb/ksu/bin/resetprop -n ro.boot.verifiedbootstate green'"
 
 adb shell "su -c 'getprop ro.boot.vbmeta.device_state'"
-# (empty — IntegrityBox clears this)
+# locked (if IntegrityBox set it, or manually via resetprop -n)
 
 adb shell "su -c 'getprop ro.build.version.security_patch'"
 # 2026-06-01 (spoofed)
@@ -400,25 +407,58 @@ Install any Play Integrity checker app (e.g. `gr.nikolasspyr.integritycheck`) an
 |---|---|
 | MEETS BASIC INTEGRITY | PASS |
 | MEETS DEVICE INTEGRITY | PASS |
-| MEETS STRONG INTEGRITY | PASS (if keybox valid) |
+| MEETS STRONG INTEGRITY | FAIL (public keybox revoked for STRONG; DEVICE passes) |
 
 ### Keybox management (for STRONG integrity)
 
 **STRONG integrity requires a valid, unrevoked `keybox.xml`** at `/data/adb/tricky_store/keybox.xml`.
 
-The keybox is a hardware attestation key leaked from a real device. Google can revoke it server-side at any time.
+The keybox is a hardware attestation key leaked from a real device. Google can revoke it server-side at any time. TrickyStore README states: *"For more than DEVICE integrity, put an unrevoked hardware keybox.xml"*.
 
-**IntegrityBox WebUI shows keybox status:**
-- Green (3 dots) = valid, passes STRONG
-- Yellow (2 green, 1 red) = passes DEVICE only
-- Red (3 red) = revoked, passes nothing beyond BASIC
+**Keybox types and current status (as of 2026-06-30):**
+
+| Keybox name | DeviceID | DEVICE | STRONG | Status |
+|---|---|---|---|---|
+| Community Keybox | `Community Keybox` | ✅ → ❌ | ❌ | Fully revoked by Google |
+| Device Integrity | `Device Integrity` | ✅ | ❌ | Works for DEVICE only — root cert serial `f92009e853b6b045` flagged for STRONG |
+| Private keybox | (varies) | ✅ | ✅ | Extremely rare — extracted from real Pixel devices, not publicly available |
+
+**How to update keybox (IntegrityBox `key.sh` script):**
+
+IntegrityBox includes a `key.sh` script that downloads a fresh keybox from the MeowDump GitHub repository:
+
+```bash
+# Method 1: Via IntegrityBox WebUI → BeastMode → "Update Keybox"
+# This runs key.sh which downloads from MeowDump/MeowDump/Megatron
+
+# Method 2: Via adb (manual)
+adb shell "su -c 'sh /data/adb/modules/playintegrityfix/webroot/common_scripts/key.sh'"
+```
+
+The `Megatron` file on GitHub is encoded (base64 ×10 → hex → ROT13). The `key.sh` script handles decoding automatically. To decode manually on a host machine:
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/MeowDump/MeowDump/refs/heads/main/Megatron" -o megatron_raw
+# base64 decode 10x (remove newlines each time)
+# hex decode with xxd -r -p
+# ROT13 decode with tr 'A-Za-z' 'N-ZA-Mn-za-m'
+# Result: valid keybox.xml (~17KB)
+```
 
 **When keybox is revoked:**
 
-1. Open IntegrityBox WebUI (KSU Next Manager → module settings)
-2. Use "Get Keybox" button (fetches from community Telegram bot `@integritybox`)
-3. Or manually replace `/data/adb/tricky_store/keybox.xml` with a new unrevoked keybox
-4. No reboot needed — TrickyStore reads keybox at each attestation call
+1. Run `key.sh` (via WebUI BeastMode or adb) to fetch the latest keybox
+2. Or manually replace `/data/adb/tricky_store/keybox.xml` with a new keybox
+3. Kill and restart the TrickyStore daemon:
+   ```bash
+   adb shell "su -c 'kill $(ps -A | grep TrickyStore | awk \"{print \\$2}\")'"
+   adb shell "su -c 'setsid /data/adb/modules/tricky_store/daemon </dev/null >/dev/null 2>&1 &'"
+   ```
+4. Force-stop GMS to clear cached attestation results:
+   ```bash
+   adb shell "su -c 'am force-stop com.google.android.gms; am force-stop com.google.android.gms.unstable'"
+   ```
+5. No reboot needed — TrickyStore reads keybox at each attestation call
 
 **Keybox format:**
 
@@ -524,17 +564,317 @@ TrickyStore intercepts the **keystore attestation pipeline** itself — it modif
 | BASIC fails | KSU-Next not hiding properly | Reboot, check KSU-Next manager status |
 | DEVICE fails | TrickyStore not injecting | Check `tee_status`, reflash TrickyStore, reboot |
 | DEVICE fails | Conflicting PIF module | Remove old PlayIntegrityFix module, keep only IntegrityBox |
-| STRONG fails | Keybox revoked | Replace keybox.xml (IntegrityBox WebUI → Get Keybox) |
+| STRONG fails | Keybox revoked | Replace keybox.xml via `key.sh` or manually (see keybox management above) |
+| STRONG fails | Public keybox (Device Integrity) only passes DEVICE | Need private unrevoked keybox — not publicly available |
 | STRONG fails | Keybox format wrong | Verify XML is well-formed, check TrickyStore logs |
+| DEVICE fails | GMS cache stale | `am force-stop com.google.android.gms; pm clear com.google.android.gms` |
+| DEVICE fails | `verifiedbootstate` prop missing | `resetprop -n ro.boot.verifiedbootstate green` (see Part 5) |
+| DEVICE fails | TrickyStore daemon not running | Restart daemon (see keybox management above) |
 | "Device not certified" in Play Store | GMS vending cache stale | IntegrityBox WebUI → clear cache, or `am force-stop com.android.vending` |
 | SELinux permissive warning | Custom kernel or module set permissive | Ensure `getenforce` returns `Enforcing` |
 | All fail after GMS update | GMS version too new / incompatible | Wait for TrickyStore update, or downgrade GMS temporarily |
+
+---
+
+## Part 3: Ozon "No Connection" Fix — TrustMeAlready SSL Hook
+
+### Problem
+
+The Ozon app (`ru.ozon.app.android`) showed a "no connection" error immediately on launch — within ~488ms, too fast for a real network round-trip. The error screen appeared before any actual network request could complete, indicating a **local failure**, not a server-side issue.
+
+### Root cause: TrustMeAlready LSPosed module
+
+**TrustMeAlready** (`com.virb3.trustmealready`, LSPosed module ID 3) was in Ozon's LSPosed scope. TrustMeAlready hooks `TrustManagerImpl.checkTrustedRecursive` in the target app's process, disabling all SSL/TLS certificate validation. This breaks the SSL handshake for apps that use **libcronet** (Chromium's network stack) — which Ozon does.
+
+**Detection chain:**
+
+```
+Ozon launches
+    │
+    ▼
+TrustMeAlready hooks TrustManagerImpl.checkTrustedRecursive in Ozon process
+    │
+    ▼
+Ozon's libcronet (libcronet.138.0.7204.157.so) attempts HTTPS to api.ozon.ru
+    │
+    ▼
+SSL/TLS handshake fails — TrustManagerImpl returns no trusted certificates
+    │
+    ▼
+Chromium net stack: SSL error code 1, net_error -207 (ERR_BAD_SSL_CLIENT_AUTH_CERT)
+    │
+    ▼
+libcronet reports UnknownHostException/ConnectException to Ozon Java layer
+    │
+    ▼
+ScreenStateExtKt.java:43 catches exception → shows R.string.error_composer_message_no_connection_full
+    │
+    ▼
+User sees "no connection" error (488ms after launch)
+```
+
+**Key evidence from logcat:**
+
+```
+SSL error code 1, net_error -207  (ERR_BAD_SSL_CLIENT_AUTH_CERT)
+BXInterceptor: Have 403 on url https://api.ozon.ru/composer-api.bx/_action/mapKeys
+FullScreenAntibotActivity appeared 488ms after launch  (too fast for network response)
+```
+
+The 403 from the antibot endpoint (`Ed0/w.java` checks HTTP 403 for `incidentId` from `AntibotDTO`) was a **secondary symptom** — the antibot system was triggered by the broken SSL handshake, not by VPN detection or DNS issues.
+
+### What it was NOT
+
+| Suspected cause | Investigated? | Ruled out? |
+|---|---|---|
+| VPNHide kernel hooks | Yes — traced 11 hooks, all working correctly | ✅ Ruled out |
+| VPNHide LSPosed Java hooks | Yes — traced NC/NI/LP writeToParcel hooks | ✅ Ruled out |
+| DNS resolution failure | Yes — tested Tele2/Google/Cloudflare/Yandex DNS | ✅ Ruled out (DNS was working) |
+| Private DNS / DoT timeout | Yes — Tele2 DNS doesn't support DoT (see [Part 4](#part-4-dns--private-dns-configuration)) | ✅ Fixed separately, but not the Ozon cause |
+| Ozon antibot detection | Yes — decompiled Ozon APK, analyzed antibot flow | ✅ Secondary symptom, not root cause |
+| RootBeer root detection | Yes — `libtoolChecker.so` is RootBeer, not VPN detection | ✅ Ruled out |
+
+### Fix
+
+Remove Ozon from TrustMeAlready's LSPosed scope. TrustMeAlready should only be applied to apps that need certificate pinning bypass (e.g., Wildberries for API interception) — **not** to apps that need valid SSL (e.g., Ozon, banking apps).
+
+**Via LSPosed DB (no sqlite3 on device):**
+
+```bash
+# Pull LSPosed DB
+adb shell "su -c 'cp /data/adb/lspd/config/modules_config.db /data/local/tmp/modules_config.db'"
+adb pull /data/local/tmp/modules_config.db /tmp/lspd.db
+
+# Edit with sqlite3 on host
+sqlite3 /tmp/lspd.db
+# View TrustMeAlready scope (mid=3):
+# SELECT * FROM scope WHERE mid=3;
+# Remove Ozon entries:
+# DELETE FROM scope WHERE mid=3 AND app_pkg_name IN ('ru.ozon.app.android', 'ru.ozon.seller_app');
+# .quit
+
+# Push back
+adb push /tmp/lspd.db /data/local/tmp/modules_config.db
+adb shell "su -c 'cp /data/local/tmp/modules_config.db /data/adb/lspd/config/modules_config.db'"
+adb shell "su -c 'cp /data/local/tmp/modules_config.db-wal /data/adb/lspd/config/modules_config.db-wal 2>/dev/null'"
+adb shell "su -c 'chown root:root /data/adb/lspd/config/modules_config.db*'"
+adb shell "su -c 'chmod 600 /data/adb/lspd/config/modules_config.db*'"
+```
+
+**Via LSPosed Manager UI:**
+
+1. Open LSPosed Manager
+2. Go to TrustMeAlready → Scope
+3. Uncheck `ru.ozon.app.android` and `ru.ozon.seller_app`
+4. Reboot (or force-stop Ozon)
+
+**After reboot:** Ozon launches and connects successfully ✅
+
+### TrustMeAlready scope recommendations
+
+| App | In scope? | Reason |
+|---|---|---|
+| `com.wildberries.ru` | ✅ Yes | Wildberries uses cert pinning that blocks API interception |
+| `wb.partners` | ✅ Yes | WB Partners seller app — same reason |
+| `system` | ✅ Yes | System-level cert bypass for debugging |
+| `ru.ozon.app.android` | ❌ No | Ozon uses libcronet — SSL bypass breaks its network stack |
+| `ru.ozon.seller_app` | ❌ No | Same as above |
+| Banking apps | ❌ No | SSL bypass breaks certificate-based mutual TLS |
+
+### Ozon antibot system (for reference)
+
+Ozon uses a server-side antibot system. When triggered (HTTP 403), it returns an `AntibotDTO` with:
+- `incidentId` — server-generated incident ID (e.g., "Incident 050")
+- `challengeURL` — URL for antibot challenge page
+- `captchaURL` — URL for CAPTCHA if needed
+- `errorText` — human-readable error message
+
+The antibot handler (`Ed0/w.java`) checks HTTP 403 responses for `incidentId` and shows `FullScreenAntibotActivity` for challenges. This is a **legitimate server-side protection** — not related to VPN, root, or SSL. If you see the antibot screen, it means the server detected suspicious behavior (too many requests, unusual patterns, etc.).
+
+---
+
+## Part 4: DNS / Private DNS Configuration
+
+### Problem
+
+After fixing the Ozon SSL issue, DNS resolution was slow (3+ seconds) for some apps, causing intermittent connection timeouts. This was caused by Android's **Private DNS** (DNS-over-TLS) configuration.
+
+### Root cause: Tele2 DNS servers do not support DoT
+
+On Tele2 Russia (carrier), the default DNS servers are:
+- `176.59.62.126` (primary)
+- `176.59.62.125` (secondary)
+
+These DNS servers **do not support DNS-over-TLS (DoT)** — port 853 times out (3+ seconds, not refused, just silently dropped). When Android's Private DNS mode is set to `opportunistic` (the default, `private_dns_mode = null`), Android tries DoT on port 853 first, waits for timeout, then falls back to plain DNS on port 53. This causes 3+ second delays on every DNS resolution.
+
+**DNS server comparison (tested from Tele2 network in Russia):**
+
+| DNS server | Port 53 (plain) | Port 853 (DoT) | Notes |
+|---|---|---|---|
+| Tele2 `176.59.62.126` | ✅ Works | ❌ Timeout (3+s) | Default carrier DNS — no DoT support |
+| Tele2 `176.59.62.125` | ✅ Works | ❌ Timeout (3+s) | Same |
+| Google `8.8.8.8` | ❌ Refused | ❌ Refused | Blocked by TSPU (Russian DPI) |
+| Cloudflare `1.1.1.1` | ❌ Refused | ❌ Refused | Blocked by TSPU |
+| Yandex `77.88.8.8` | ✅ Works | ✅ Works (DoT) | Only Russian DNS with DoT that works |
+
+**Russia whitelist mode note:** Foreign DNS servers (8.8.8.8, 1.1.1.1) are blocked by TSPU until a VPN tunnel is up. Even with VPN, using foreign DNS for plain DNS can cause issues. Yandex DNS (77.88.8.8) is the most reliable choice for Russia.
+
+### Fix: Disable Private DNS
+
+```bash
+# Check current Private DNS mode
+adb shell "settings get global private_dns_mode"
+# null = opportunistic (default) — causes DoT timeout on Tele2
+
+# Disable Private DNS (use plain DNS only)
+adb shell "settings put global private_dns_mode off"
+
+# Verify
+adb shell "settings get global private_dns_mode"
+# off
+```
+
+**Do NOT use `private_dns_mode = hostname` with Tele2 DNS:**
+
+```bash
+# This BREAKS DNS entirely:
+adb shell "settings put global private_dns_mode hostname"
+adb shell "settings put global private_dns_specifier dns.yandex.ru"
+# Android tries DoT to Tele2's DNS servers (not dns.yandex.ru!) → all DNS fails
+# Tele2 DNS doesn't support DoT → complete DNS outage
+```
+
+The `private_dns_specifier` only works when the carrier DNS servers support DoT — it specifies the hostname for the TLS certificate, but Android still connects to the **carrier's DNS servers** on port 853, not to the specified hostname. On Tele2, this means DoT goes to `176.59.62.126:853` which times out.
+
+### Recommended DNS configuration for Tele2 Russia
+
+```bash
+# Disable Private DNS (plain DNS via carrier)
+adb shell "settings put global private_dns_mode off"
+
+# If using VPN tether (VPN Tether module), DNS is handled by the module:
+# - DHCP pushes 77.88.8.8 (Yandex DNS) to tethered clients
+# - DNAT rule redirects all tethered DNS traffic to 77.88.8.8
+# - This bypasses carrier DNS entirely for tethered clients
+```
+
+### Verification
+
+```bash
+# Test DNS resolution speed
+adb shell "su -c 'time nslookup api.ozon.ru'"
+# Should resolve in <100ms with private_dns_mode=off
+
+# Test with DoT (should timeout on Tele2):
+adb shell "su -c 'time nc -w3 176.59.62.126 853 && echo open || echo timeout'"
+# timeout (3+ seconds)
+
+# Test plain DNS (should work instantly):
+adb shell "su -c 'time nc -w3 176.59.62.126 53 && echo open || echo timeout'"
+# open (instant)
+```
+
+---
+
+## Part 5: verifiedbootstate & resetprop_if_diff bug
+
+### Problem
+
+After reboot, `ro.boot.verifiedbootstate` was empty (not set). Play Integrity DEVICE check requires this prop to be `green`. IntegrityBox's `resetprop_if_diff` function was supposed to set it, but didn't.
+
+### Root cause: IntegrityBox `resetprop_if_diff` bug
+
+The `resetprop_if_diff` function in `/data/adb/modules/playintegrityfix/common_func.sh` has a logic bug:
+
+```bash
+# Buggy implementation:
+resetprop_if_diff() {
+    NAME="$1"
+    EXPECTED="$2"
+    CURRENT=$(getprop "$NAME")
+    [ -z "$CURRENT" ] || [ "$CURRENT" = "$EXPECTED" ] || $RESETPROP "$NAME" "$EXPECTED"
+}
+```
+
+The logic `[ -z "$CURRENT" ] || [ "$CURRENT" = "$EXPECTED" ] || $RESETPROP "$NAME" "$EXPECTED"` means:
+1. If `CURRENT` is empty → first condition `[ -z "$CURRENT" ]` is true → **short-circuits, prop never set**
+2. If `CURRENT` equals `EXPECTED` → second condition is true → short-circuits, no need to set (correct)
+3. If `CURRENT` differs from `EXPECTED` → both false → prop is set (correct)
+
+**The bug:** When the prop doesn't exist at all (empty), the function **skips setting it** — the exact opposite of what's needed. Non-existent props are the most common case on devices that don't have these props in kernel bootargs.
+
+### Why `ro.boot.verifiedbootstate` is missing on OnePlus 7 Pro
+
+OnePlus 7 Pro (guacamole, OOS 11) does not include `ro.boot.verifiedbootstate` in the kernel bootargs. The prop simply doesn't exist after boot. Other props that may be missing:
+- `ro.boot.flash.locked` — exists but set to `0` (unlocked)
+- `ro.boot.vbmeta.device_state` — exists, set to `locked` (but can be wrong on some ROMs)
+
+### Fix: Manual resetprop after each boot
+
+```bash
+# Set the missing/wrong props manually
+adb shell "su -c '/data/adb/ksu/bin/resetprop -n ro.boot.verifiedbootstate green'"
+adb shell "su -c '/data/adb/ksu/bin/resetprop -n ro.boot.flash.locked 1'"
+adb shell "su -c '/data/adb/ksu/bin/resetprop -n ro.boot.vbmeta.device_state locked'"
+
+# Verify
+adb shell "getprop ro.boot.verifiedbootstate"  # green
+adb shell "getprop ro.boot.flash.locked"       # 1
+adb shell "getprop ro.boot.vbmeta.device_state" # locked
+```
+
+**Note:** These props are NOT persistent across reboots — `resetprop -n` sets them in the running property service, but they're reset on reboot. You must re-run these commands after every reboot, or create a post-fs-data.sh script.
+
+### Automated fix (persistent across reboots)
+
+Create a KSU module or add to an existing module's `post-fs-data.sh`:
+
+```bash
+#!/system/bin/sh
+RESETPROP="/data/adb/ksu/bin/resetprop"
+$RESETPROP -n ro.boot.verifiedbootstate green
+$RESETPROP -n ro.boot.flash.locked 1
+$RESETPROP -n ro.boot.vbmeta.device_state locked
+```
+
+Or patch the IntegrityBox bug directly:
+
+```bash
+# Pull common_func.sh
+adb shell "su -c 'cp /data/adb/modules/playintegrityfix/common_func.sh /data/local/tmp/common_func.sh'"
+adb pull /data/local/tmp/common_func.sh
+
+# Fix the bug: change [ -z "$CURRENT" ] || to always set when empty
+# Original:  [ -z "$CURRENT" ] || [ "$CURRENT" = "$EXPECTED" ] || $RESETPROP "$NAME" "$EXPECTED"
+# Fixed:     [ "$CURRENT" = "$EXPECTED" ] || $RESETPROP "$NAME" "$EXPECTED"
+
+# Push back
+adb push common_func.sh /data/local/tmp/common_func.sh
+adb shell "su -c 'cp /data/local/tmp/common_func.sh /data/adb/modules/playintegrityfix/common_func.sh'"
+adb shell "su -c 'chmod 644 /data/adb/modules/playintegrityfix/common_func.sh'"
+```
+
+The fix removes the `[ -z "$CURRENT" ] ||` clause entirely — if the prop is empty OR differs from expected, it gets set. This is the correct behavior: non-existent props should be created with the expected value.
+
+### Full prop verification checklist
+
+```bash
+# All props that Play Integrity checks:
+adb shell "getprop ro.boot.verifiedbootstate"        # green
+adb shell "getprop ro.boot.flash.locked"             # 1
+adb shell "getprop ro.boot.vbmeta.device_state"      # locked
+adb shell "getprop ro.build.type"                    # user
+adb shell "getprop ro.build.tags"                    # release-keys
+adb shell "getprop ro.debuggable"                    # 0
+adb shell "getprop ro.secure"                        # 1
+adb shell "getprop ro.build.version.security_patch"  # 2026-06-01 (or recent)
+```
 
 ### Sources
 
 - [TrickyStore](https://github.com/5ec1cff/TrickyStore) — 5ec1cff, v1.4.1, Nov 2025
 - [IntegrityBox](https://github.com/MeowDump/Integrity-Box) — MeowDump, v37, actively maintained
-- [KeyBoxer](https://github.com/shall0e/KeyBoxer) — free keybox scraper (community keyboxes)
 - [VPN Hide](https://github.com/okhsunrog/vpnhide) — Xposed module for Java-level VPN hiding
+- [TrustMeAlready](https://github.com/ViRb3/TrustMeAlready) — LSPosed module for SSL certificate pinning bypass
 - [ReZygisk](https://github.com/PerformanC/ReZygisk) — standalone Zygisk implementation
 - [zygisk_lsposed](https://github.com/LSPosed/LSPosed) — LSPosed via Zygisk
