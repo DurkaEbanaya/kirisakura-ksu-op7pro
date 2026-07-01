@@ -878,3 +878,223 @@ adb shell "getprop ro.build.version.security_patch"  # 2026-06-01 (or recent)
 - [TrustMeAlready](https://github.com/ViRb3/TrustMeAlready) — LSPosed module for SSL certificate pinning bypass
 - [ReZygisk](https://github.com/PerformanC/ReZygisk) — standalone Zygisk implementation
 - [zygisk_lsposed](https://github.com/LSPosed/LSPosed) — LSPosed via Zygisk
+
+---
+
+## Part 6: OemFix — Developer Settings Crash Fix
+
+### Problem
+
+Opening Developer Settings (`com.android.settings/.Settings$DevelopmentSettingsDashboardActivity`) crashes with:
+
+```
+java.lang.NullPointerException: Attempt to invoke virtual method
+'boolean android.service.oemlock.OemLockManager.isOemUnlockAllowed()'
+on a null object reference
+
+at com.android.settings.development.OemUnlockPreferenceController.isOemUnlockedAllowed(OemUnlockPreferenceController.java:292)
+at com.android.settings.development.OemUnlockPreferenceController.updateState(OemUnlockPreferenceController.java:170)
+at com.android.settings.development.OemUnlockPreferenceController$2$1.run(OemUnlockPreferenceController.java:338)
+```
+
+### Root cause
+
+This is a **OnePlus firmware bug**, not caused by the custom kernel or root.
+
+`OemUnlockPreferenceController` (AOSP 11) obtains `OemLockManager` via `getSystemService(Context.OEM_LOCK_SERVICE)`. On the OnePlus 7 Pro (OOS 11 `GM1910_21_220617`), this returns **null** because:
+
+1. The `oem_lock` service is registered in `ServiceManager` (service #122) and responds to binder calls
+2. `OemLockManager` is registered in `SystemServiceRegistry$82` in `framework.jar`
+3. SELinux allows `system_app` → `find` → `oem_lock_service`
+4. **But** `OemLockManager` is not fully instantiated — `dumpsys oem_lock` returns empty output
+5. OnePlus uses their own SIM Lock mechanism (`uimRemoteSimlockGetSimlockStatusResponse`, `remotesimlockmanagerlibrary.jar`) instead of standard AOSP `OemLockService`
+
+The AOSP 11 `OemUnlockPreferenceController` constructor posts a callback that calls `updateState()` → `isOemUnlockedAllowed()` → `mOemLockManager.isOemUnlockAllowed()` **without a null check**. The `isAvailable()` method correctly returns `false` when `mOemLockManager` is null, but the callback runs before `isAvailable()` is checked. This null-check was only added in Android 12+.
+
+### Fix — two layers
+
+#### Layer 1: boot-props KSU module (root cause prevention)
+
+The `boot-props` module (see Part 7) sets `ro.oem_unlock_supported=0` at `post-fs-data` time, before any app process starts. This causes `OemUnlockPreferenceController` to log `"oem_unlock not supported"` and take a code path that never calls `mOemLockManager.isOemUnlockAllowed()` — preventing the NPE entirely.
+
+**This alone fixes the crash at boot time.** Settings opens without crashing because the prop is set before the controller is constructed.
+
+#### Layer 2: OemFix LSPosed module (safety net)
+
+A minimal LSPosed module (`com.durka.oemfix`, 12.8 KB APK) that hooks `updateState()` and `isOemUnlockedAllowed()` in `OemUnlockPreferenceController`:
+
+```java
+// If mOemLockManager is null, skip the call instead of crashing
+XposedBridge.hookAllMethods(clazz, "updateState", new XC_MethodReplacement() {
+    @Override
+    protected Object replaceHookedMethod(MethodHookParam param) throws Throwable {
+        Object mgr = XposedHelpers.getObjectField(param.thisObject, "mOemLockManager");
+        if (mgr == null) {
+            Log.d(TAG, "Skipping updateState: mOemLockManager is null");
+            return null; // void method
+        }
+        return XposedBridge.invokeOriginalMethod(param.method, param.thisObject, param.args);
+    }
+});
+```
+
+This catches the NPE if it ever occurs despite Layer 1 — e.g., if Settings is restarted after props are somehow cleared, or if a future OOS update changes the code path.
+
+### OemFix module installation
+
+The module is built without Gradle — using `javac` → `d8` → `aapt2` → `zipalign` → `apksigner`:
+
+```bash
+# Compile Xposed API stubs + hook
+javac -source 11 -target 11 -d build/obj -cp "stubs:$ANDROID_JAR" \
+    stubs/de/robv/android/xposed/*.java \
+    src/com/durka/oemfix/*.java
+
+# Convert to DEX (only hook classes, not stubs)
+d8 --min-api 30 --output build build/obj/com/durka/oemfix/FixEntry*.class
+
+# Package APK
+aapt2 link --manifest AndroidManifest.xml -o oemfix-unsigned.apk \
+    -I $ANDROID_JAR --min-sdk-version 30 --target-sdk-version 34 \
+    compiled/values_arrays.arsc.flat
+zip -j oemfix-unsigned.apk classes.dex
+zip oemfix-unsigned.apk assets/xposed_init
+zipalign -f 4 oemfix-unsigned.apk oemfix-aligned.apk
+apksigner sign --ks release.keystore --ks-key-alias release \
+    --ks-pass pass:PASSWORD --out oemfix-signed.apk oemfix-aligned.apk
+```
+
+**Critical:** `XposedBridge.hookAllMethods` returns `Set<XC_MethodHook.Unhook>`, not `Unhook`. Using the wrong return type in the Xposed API stubs causes `NoSuchMethodError` at runtime because the DEX method descriptor doesn't match.
+
+### LSPosed DB configuration
+
+The module must be manually added to the LSPosed database:
+
+```sql
+-- Enable module
+UPDATE modules SET enabled=1 WHERE module_pkg_name='com.durka.oemfix';
+
+-- Add scope (Settings process only)
+INSERT INTO scope (mid, app_pkg_name, user_id)
+VALUES (6, 'com.android.settings', 0);
+```
+
+After updating the DB, reboot (or kill zygote) for LSPosed to reload the module list.
+
+### Verification
+
+```
+I LSPosed-Bridge: Loading legacy module com.durka.oemfix
+I LSPosed-Bridge:   Loading class com.durka.oemfix.FixEntry
+I OemFix  : Hooks installed for com.android.settings
+W OemUnlockPreferenceController: oem_unlock not supported.
+```
+
+Settings process stays alive, no FATAL EXCEPTION, no soft reboot.
+
+---
+
+## Part 7: Boot Props Persistence Module
+
+### Problem
+
+The OnePlus 7 Pro bootloader does not pass `androidboot.flash.locked` or `androidboot.verifiedbootstate` in the kernel cmdline. Only `androidboot.vbmeta.device_state=unlocked` is present:
+
+```
+# /proc/cmdline (relevant params):
+androidboot.vbmeta.device_state=unlocked
+```
+
+This means after every reboot:
+- `ro.boot.verifiedbootstate` — **missing** (should be `green` for locked bootloader)
+- `ro.boot.flash.locked` — **missing** (should be `1` for locked)
+- `ro.boot.vbmeta.device_state` — `unlocked` (should be `locked`)
+
+Without these props, Play Integrity fails DEVICE check because Google Play Services detects an unlocked bootloader.
+
+### IntegrityBox bug
+
+IntegrityBox (playintegrityfix) v37 tries to set these props via `resetprop_if_diff` in `service.sh`:
+
+```bash
+resetprop_if_diff "ro.boot.vbmeta.device_state" "locked"
+resetprop_if_diff "ro.boot.verifiedbootstate" "green"
+resetprop_if_diff "ro.boot.flash.locked" "1"
+```
+
+But `resetprop_if_diff` has a **logic bug** in `common_func.sh`:
+
+```bash
+resetprop_if_diff() {
+    local NAME="$1"
+    local EXPECTED="$2"
+    local CURRENT
+
+    CURRENT="$(resetprop "$NAME")"
+    [ -z "$CURRENT" ] || [ "$CURRENT" = "$EXPECTED" ] || $RESETPROP "$NAME" "$EXPECTED"
+}
+```
+
+The `||` chain short-circuits: when `CURRENT` is empty (prop doesn't exist), `[ -z "$CURRENT" ]` is true, the entire expression evaluates to true, and `$RESETPROP` is **never executed**. Props that don't exist are silently skipped instead of being created.
+
+**Correct implementation** would be:
+```bash
+[ "$CURRENT" = "$EXPECTED" ] || $RESETPROP "$NAME" "$EXPECTED"
+```
+
+### Fix — boot-props KSU module
+
+A minimal KSU module (`boot-props`) with a `post-fs-data.sh` script that force-sets all bootloader status props using `resetprop -n` (which can create non-existent props):
+
+```bash
+#!/system/bin/sh
+# Wait for property service
+while [ "$(getprop ro.crypto.state)" != "encrypted" ] && \
+      [ "$(getprop ro.crypto.state)" != "unsupported" ]; do
+    sleep 1
+done
+
+# Force-set all bootloader status props
+resetprop -n ro.boot.verifiedbootstate green
+resetprop -n ro.boot.flash.locked 1
+resetprop -n ro.boot.vbmeta.device_state locked
+resetprop -n vendor.boot.verifiedbootstate green
+resetprop -n vendor.boot.vbmeta.device_state locked
+resetprop -n sys.oem_unlock_allowed 0
+resetprop -n ro.oem_unlock_supported 0
+```
+
+**Key design decisions:**
+
+1. **`post-fs-data.sh` not `service.sh`** — runs at the earliest possible point (after `/data` is mounted, before zygote). Props are set before any app process starts, so all apps read the correct values from the beginning.
+
+2. **`resetprop -n` not `resetprop_if_diff`** — the `-n` flag creates the prop if it doesn't exist and modifies it if it does. No buggy conditional logic.
+
+3. **`ro.oem_unlock_supported=0`** — as a side effect, this also prevents the `OemUnlockPreferenceController` crash (see Part 6). When this prop is `0` at boot time, the controller takes a "not supported" code path that never calls the null `OemLockManager`.
+
+4. **Runs before IntegrityBox** — `post-fs-data.sh` runs before `service.sh`. By the time IntegrityBox's `service.sh` executes, the props already exist, and `resetprop_if_diff` sees non-empty `CURRENT` values and works correctly (as a redundant safety check).
+
+### Installation
+
+```bash
+# Create module directory
+adb shell "su -c 'mkdir -p /data/adb/modules/boot-props'"
+
+# Push files
+adb push module.prop /data/local/tmp/
+adb push post-fs-data.sh /data/local/tmp/
+adb shell "su -c 'cp /data/local/tmp/module.prop /data/adb/modules/boot-props/'"
+adb shell "su -c 'cp /data/local/tmp/post-fs-data.sh /data/adb/modules/boot-props/'"
+adb shell "su -c 'chmod 755 /data/adb/modules/boot-props/post-fs-data.sh'"
+adb shell "su -c 'chmod 644 /data/adb/modules/boot-props/module.prop'"
+```
+
+### Verification after reboot
+
+```bash
+adb shell "getprop ro.boot.verifiedbootstate"       # green
+adb shell "getprop ro.boot.flash.locked"            # 1
+adb shell "getprop ro.boot.vbmeta.device_state"     # locked
+adb shell "su -c 'cat /data/local/tmp/boot-props.log'"
+# [boot-props] Props set: verifiedbootstate=green, flash.locked=1, vbmeta.device_state=locked
+```

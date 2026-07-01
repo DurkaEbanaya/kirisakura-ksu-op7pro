@@ -1,0 +1,8 @@
+2026-07-01 23:40:21.637 adb[91912:687835] [CornerFix] constructor loaded process=adb bundle=(none) lite=0
+id=meta-kirisakura
+metamodule=1
+name=Kirisakura OverlayFS MetaModule
+version=1.0
+versionCode=1
+author=DurkaEbanaya
+description=Shell-based OverlayFS metamodule for KernelSU Next. Designed for OnePlus 7 Pro (kernel 4.14) with vendor overlay support. Handles /system/india/* -> /system/product/* overlay remapping.

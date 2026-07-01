@@ -1,0 +1,6 @@
+id=boot-props
+name=Boot Props Persistence
+version=v1.0
+versionCode=1
+author=DurkaEbanaya
+description=Persistently set bootloader status props (verifiedbootstate, flash.locked, vbmeta.device_state) for Play Integrity. Works around IntegrityBox resetprop_if_diff bug that skips non-existent props.

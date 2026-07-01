@@ -2,9 +2,13 @@
 
 Custom kernel **Kirisakura 4.14.243** with **KernelSU-Next v3.1.0-legacy** (version 33024), **161 security patches** from linux-4.14.244–4.14.336, **built-in VPNHide**, and **fully kernel-level WiFi hotspot fix** for OnePlus 7 Pro on stock OxygenOS 11 (`GM1910_21_220617`, Android 11).
 
-**Working:** Root (KSU Next) · FOD fingerprint · WiFi · Bluetooth · SELinux Enforcing · WiFi Hotspot/Tethering (no module needed) · VPN interface hiding (kernel + Java) · Play Integrity (BASIC + DEVICE + STRONG)
+**Working:** Root (KSU Next) · FOD fingerprint · WiFi · Bluetooth · SELinux Enforcing · WiFi Hotspot/Tethering (no module needed) · VPN interface hiding (kernel + Java) · Play Integrity (BASIC + DEVICE) · Developer Settings (OemFix) · Boot props persistence
 
-See [LSPOSED-AND-INTEGRITY.md](LSPOSED-AND-INTEGRITY.md) for the LSPosed Java hooks setup and Play Integrity bypass guide.
+See [LSPOSED-AND-INTEGRITY.md](LSPOSED-AND-INTEGRITY.md) for the LSPosed Java hooks setup, Play Integrity bypass, OemFix Developer Settings crash fix, and boot props persistence guide.
+
+See [RVT-REPLACE-ISSUE.md](RVT-REPLACE-ISSUE.md) for the YouTube overlay crash diagnosis — why systemless APK replacement via overlayfs breaks `ModuleInfoProvider` in `system_server`.
+
+See [modules/README.md](modules/README.md) for KSU module installation guides (boot-props, oemfix, meta-kirisakura, vpnhide-kmod).
 
 ---
 
